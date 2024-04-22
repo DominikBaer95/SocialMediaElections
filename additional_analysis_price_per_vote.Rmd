@@ -1,0 +1,133 @@
+---
+title: "Price per vote"
+author: "Dominik Bär"
+date: "2023-04-06"
+output: html_document
+---
+
+# File description
+
+```{r}
+
+# This file contains an additional analysis studying the price per vote 
+
+```
+
+# Set up environment
+
+```{r, include=FALSE, echo=FALSE}
+
+# Clean environment
+rm(list = ls())
+
+# Load packages
+library(tidyverse)
+library(lubridate)
+library(haven)
+
+
+source("utils.R")
+
+# Set seed
+set.seed(42)
+
+# Define paths to data
+path_data <- "../data/"
+path_figures <- "../doc/Nat Communitcaionts/figures/"
+
+# Party names
+parties <- c("cdu", "csu", "spd", "afd", "fdp", "linke", "gruene")
+# Party colors
+parties_colors <- c("#e3000f", "#000000", "#46962b", "#ffed00", "#009ee0", "#b61c3e")
+# Federal states germany
+states <- c("Bayern", "Baden-Württemberg", "Thüringen", "Hessen", "Saarland", "Rheinland-Pfalz", "Nordrhein-Westfalen", "Niedersachsen", "Sachsen-Anhalt", "Sachsen", "Brandenburg", "Mecklenburg-Vorpommern", "Schleswig-Holstein", "Berlin", "Hamburg", "Bremen")
+
+```
+
+# Load data
+
+```{r, include=FALSE, echo=FALSE}
+
+# Load candidate covariates
+candidates <- read_csv(str_c(path_data, "misc/candidate_covariates.csv")) %>%
+  mutate(across(.cols = c(constituency, job, incumbent, female, election_list, matches("effort_consulting_")), ~ as_factor(.x)))
+
+# Load model data frame (all direct canidates)
+df_model <- read_csv(str_c(path_data, "df_model.csv")) %>%
+  mutate(across(.cols = c(constituency, job, incumbent, female, election_list, matches("effort_consulting_")), ~ as_factor(.x)))
+
+```
+
+# Re-estimate choice model from main analysis
+
+```{r}
+
+# Estimate model
+model_choice <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = df_model)
+
+```
+
+# Calculate price of a vote (choice model)
+
+```{r}
+
+price_per_impression <- sum(df_model$spend)/sum(df_model$impressions)
+std_impression <- sd(df_model$impressions)
+turnout <- 0.766
+avg_number_votes <- mean(df_model$party_votes_direct)
+avg_voters_per_constituency <- df_model %>% distinct(constituency, .keep_all = TRUE) %>% summarize(eligible_voters = mean(eligible_voters)) %>% pull()
+coef_impressions <- model_choice$coefficients[["impressions_std"]]
+
+# Price of 1 s.d. impressions
+price_sd_impressions <- std_impression * price_per_impression
+# Votes per 1 s.d. impressions
+votes_sd_impressions <- avg_number_votes * (exp(coef_impressions) -1)
+# => votes per 1 s.d. impressions: 503.86; ~ 500
+# Avg. price per vote
+price_per_vote <- price_sd_impressions/votes_sd_impressions
+# => price per vote: 4.73 €
+
+```
+
+# Close races
+
+```{r}
+
+# Compute vote differences between winning and second candidate in each constituency
+close_races <- df_model %>%
+  select(candidate_id, vote_share_direct, eligible_voters, abstentions, constituency, party) %>%
+  mutate(valid_votes = eligible_voters - abstentions,
+         votes = vote_share_direct * valid_votes) %>%
+  group_by(constituency) %>%
+  slice_max(order_by = votes, n = 2) %>%
+  mutate(votes_to_first = abs(votes - lag(votes)),
+         party_first_second = str_c(lag(party), "_", party)) %>%
+  filter(!is.na(votes_to_first)) %>%
+  ungroup() %>%
+  arrange(votes_to_first)
+
+```
+
+# Compute how many races could have been flipped
+
+```{r}
+
+# Average budget of canidate
+avg_budget <- mean(candidates$effort_budget, na.rm = TRUE)
+
+# Budget to invest
+part_budget <- c(0.01, 0.05, 0.1, 0.2)
+invest_budget <- avg_budget * part_budget
+
+# Compute additional votes
+add_votes <- invest_budget /  price_per_vote
+
+# How many races could have been flipped for 
+n_races_flipped <- map(add_votes, ~ close_races %>% filter(votes_to_first <= .x))
+names(n_races_flipped) <- part_budget
+n_races_flipped
+
+```
+
+

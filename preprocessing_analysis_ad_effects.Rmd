@@ -1,0 +1,404 @@
+---
+title: "preprocessing_regression_analysis"
+author: "Dominik Bär"
+date: "2023-01-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# File description
+
+```{r}
+
+# This file combines and preprocesses all data necessary for the analysis
+# In partiuclar, this includes the Ad data, election data, candidate data, etc..
+# As a result we obtain a final file for descriptive and regression analysis.
+
+```
+
+# Set up environment
+
+```{r, include=FALSE, echo=FALSE}
+
+# Clean environment
+rm(list = ls())
+
+# Load packages
+library(tidyverse)
+library(lubridate)
+library(haven)
+library(missForest)
+
+
+# Set seed
+set.seed(42)
+
+# Define paths to data
+path_data <- "../data/"
+
+# Party names
+parties <- c("cdu", "csu", "spd", "afd", "fdp", "linke", "gruene")
+# Federal states germany
+states <- c("Bayern", "Baden-Württemberg", "Thüringen", "Hessen", "Saarland", "Rheinland-Pfalz", "Nordrhein-Westfalen", "Niedersachsen", "Sachsen-Anhalt", "Sachsen", "Brandenburg", "Mecklenburg-Vorpommern", "Schleswig-Holstein", "Berlin", "Hamburg", "Bremen")
+
+```
+
+# Load data
+
+```{r, include=FALSE, echo=FALSE}
+
+# Load candidate data
+candidates <- read_csv(str_c(path_data, "misc/btw21_candidates_processed.csv"))
+
+# Load facebook data
+fb <- read_csv(str_c(path_data, "fb_ad_library/processed/", "fb.csv"))
+fb_regions <- read_csv(str_c(path_data, "fb_ad_library/processed/", "fb_regions.csv"))
+fb_demographics <- read_csv(str_c(path_data, "fb_ad_library/processed/", "fb_demographics.csv"))
+fb_candidates <- read_csv(str_c(path_data, "fb_ad_library/processed/", "fb_candidates.csv"))
+
+# Load election results data
+# Constituency level
+election_data <- read_delim(file = str_c(path_data, "misc/", "btw21_results_by_constiutency.csv"), delim = ";") %>%
+  # Filter aggregated results for states
+  filter(!(Gebiet %in% c(states, "Bundesgebiet")))
+
+# Polling station level
+election_data_granular <- read_delim(file = str_c(path_data, "misc/", "btw21_results_by_polling_station.csv"), delim = ";")
+
+# Load constituency data
+constituency_data <- read_delim(file = str_c(path_data, "misc/", "btw21_structural_data_constituency_processed.csv"), delim = ",")
+
+# Load gesis data (further candidate characteristics, see https://gles.eu/ for furhter information)
+gesis_candidates <- read_dta(str_c(path_data, "misc/GLES/Candidates/ZA7704_v1-0-0.dta")) # Load candidate data
+
+```
+
+# Prepare election data
+
+```{r, include=FALSE, echo=FALSE}
+
+# Save column names of election results
+colnames <- election_data %>%
+  dplyr::select(c(1, 2, seq(16, 208, 4))) %>%
+  colnames()
+  
+# Results BTW 21 direct votes
+results21_direct <- election_data %>%
+  # Select relevant columns (i.e. results direct votes in BTW 2021 and constituency)
+  dplyr::select(c(1, 2, 4, seq(16, 208, 4))) %>%
+  filter(!is.na(Nr)) %>%
+  rename("constituency" = "Nr", "constituency_name" = "Gebiet", "eligible_voters" = "Wahlberechtigte", "votes" = "Gültige Stimmen",  "cdu" = "Christlich Demokratische Union Deutschlands", "spd" = "Sozialdemokratische Partei Deutschlands", "afd" = "Alternative für Deutschland", "fdp" = "Freie Demokratische Partei", "linke" = "DIE LINKE", "gruene" = "BÜNDNIS 90/DIE GRÜNEN", "csu" = "Christlich-Soziale Union in Bayern e.V.") %>%
+  # Change type to numeric
+  mutate(across(.cols = c(-constituency_name), ~ as.numeric(.x))) %>%
+  rowwise() %>%
+  # Aggregate "others" and "union"
+  mutate(others = sum(c_across(c(-constituency, -constituency_name, -eligible_voters, -votes, -all_of(parties))), na.rm = TRUE),
+         union = sum(cdu, csu, na.rm = TRUE)) %>%
+  dplyr::select(constituency, constituency_name, eligible_voters, votes, all_of(parties), union, others, -cdu, -csu) %>%
+  # Calculate abstentions
+  mutate(abstentions = eligible_voters - votes) %>%
+  ungroup() %>%
+  # Change to long format for merging
+  pivot_longer(cols = spd:others, names_to = "party", values_to = "party_votes_direct") %>%
+  # Calculate vote share
+  mutate(vote_share_direct = party_votes_direct/votes) %>%
+  # Calculate log vote ratio
+  mutate(log_vote_ratio = log(party_votes_direct/abstentions)) %>%
+  # Select relevant variables
+  dplyr::select(constituency, eligible_voters, abstentions, party, party_votes_direct, vote_share_direct, log_vote_ratio)
+
+# Results BTW 21 second vote
+results21_second <- election_data %>%
+  # Select relevant columns (i.e. results direct votes in BTW 2021 and constituency)
+  dplyr::select(c(1, 2, seq(18, 210, 4))) %>%
+  filter(!is.na(Nr)) %>%
+  rename_with(~ colnames, .cols = everything()) %>%
+  rename("constituency" = "Nr", "constituency_name" = "Gebiet", "votes" = "Gültige Stimmen",  "cdu" = "Christlich Demokratische Union Deutschlands", "spd" = "Sozialdemokratische Partei Deutschlands", "afd" = "Alternative für Deutschland", "fdp" = "Freie Demokratische Partei", "linke" = "DIE LINKE", "gruene" = "BÜNDNIS 90/DIE GRÜNEN", "csu" = "Christlich-Soziale Union in Bayern e.V.") %>%
+  # Change type to numeric
+  mutate(across(.cols = c(-constituency_name), ~ as.numeric(.x))) %>%
+  rowwise() %>%
+  # Aggregate "others" and "union"
+  mutate(others = sum(c_across(c(-constituency, -constituency_name, -votes, -all_of(parties))), na.rm = TRUE),
+         union = sum(cdu, csu, na.rm = TRUE)) %>%
+  dplyr::select(constituency, constituency_name, votes, all_of(parties), union, others, -cdu, -csu) %>%
+  ungroup() %>%
+  # Change to long format for merging
+  pivot_longer(cols = spd:others, names_to = "party", values_to = "party_votes_second") %>%
+  # Calculate vote share
+  mutate(vote_share_second = party_votes_second/votes) %>%
+  # Select relevant variables
+  dplyr::select(constituency, party, party_votes_second, vote_share_second)
+
+# Results BTW 17 direct vote
+results17_direct <- election_data %>%
+  # Select relevant columns (i.e. results direct votes in BTW 2017 and constituency)
+  dplyr::select(c(1, 2, seq(17, 209, 4))) %>%
+  filter(!is.na(Nr)) %>%
+  rename_with(~ colnames, .cols = everything()) %>%
+  rename("constituency" = "Nr", "constituency_name" = "Gebiet", "votes" = "Gültige Stimmen",  "cdu" = "Christlich Demokratische Union Deutschlands", "spd" = "Sozialdemokratische Partei Deutschlands", "afd" = "Alternative für Deutschland", "fdp" = "Freie Demokratische Partei", "linke" = "DIE LINKE", "gruene" = "BÜNDNIS 90/DIE GRÜNEN", "csu" = "Christlich-Soziale Union in Bayern e.V.") %>%
+  # Change type to numeric
+  mutate(across(.cols = c(-constituency_name), ~ as.numeric(.x))) %>%
+  rowwise() %>%
+  # Aggregate "others" and "union"
+  mutate(others = sum(c_across(c(-constituency, -constituency_name, -votes, -all_of(parties))), na.rm = TRUE),
+         union = sum(cdu, csu, na.rm = TRUE)) %>%
+  dplyr::select(constituency, constituency_name, votes, all_of(parties), union, others, -cdu, -csu) %>%
+  ungroup() %>%
+  # Change to long format for merging
+  pivot_longer(cols = spd:others, names_to = "party", values_to = "party_votes_direct17") %>%
+  # Calculate vote share
+  mutate(vote_share_direct17 = party_votes_direct17/votes) %>%
+  # Select relevant variables
+  dplyr::select(constituency, party, party_votes_direct17, vote_share_direct17)
+
+# Merge election results
+election_results <- reduce(list(results21_direct, results21_second, results17_direct), left_join, by = c("constituency", "party")) %>%
+  mutate(across(c(matches("share|votes")), ~ ifelse(is.na(.x), 0, .x))) %>%
+  select(constituency, eligible_voters, abstentions, party, starts_with("vote_share_"), starts_with("party_votes_"), log_vote_ratio)
+
+```
+
+# Prepare election data from polling stations
+
+```{r}
+
+# Direct votes
+results21_polling_direct <- election_data_granular %>%
+  # Select relevant columns (i.e., direct votes in BTW 2021, polling station, constituency)
+  dplyr::select(c(1, 10:12, 19:64)) %>%
+  rename_with(~ str_remove(.x, pattern = "...\\d+"), .cols = everything()) %>%
+  rename("constituency" = "Wahlkreis", "polling_station" = "Wahlbezirk", "station_type" = "Bezirksart", "eligible_voters" = "Wahlberechtigte (A)", "votes" = "Gültige", "cdu" = "CDU", "spd" = "SPD", "afd" = "AfD", "fdp" = "FDP", "linke" = "DIE LINKE", "gruene" = "GRÜNE", "csu" = "CSU") %>%
+  # Drop first column (i.e., denotes first and second votes; see data sheet)
+  filter(!is.na(constituency)) %>%
+  # Filter polling stations (we exclude mail-in stations and other special polling stations)
+  filter(station_type == 0) %>%
+  # Filter polling stations without eligible voters
+  filter(eligible_voters > 0) %>%
+  # Assign unique polling station number
+  mutate(polling_station = row_number()) %>%
+  # Change type to numeric
+  mutate(across(.cols = everything(), ~ as.numeric(.x))) %>%
+  rowwise() %>%
+  # Aggregate "others" and "union"
+  mutate(others = sum(c_across(c(-constituency, -polling_station, -station_type, -eligible_voters, -votes, -all_of(parties))), na.rm = TRUE),
+         union = sum(cdu, csu, na.rm = TRUE)) %>%
+  dplyr::select(constituency, polling_station, eligible_voters, votes, all_of(parties), union, others, -cdu, -csu) %>%
+  # Calculate abstentions
+  mutate(abstentions_ps = eligible_voters - votes) %>%
+  ungroup() %>%
+  # Change to long format for merging
+  pivot_longer(cols = spd:others, names_to = "party", values_to = "party_votes_direct_ps") %>%
+  # Calculate vote share
+  mutate(vote_share_direct_ps = party_votes_direct_ps/votes) %>%
+  # Calculate log vote ratio
+  mutate(log_vote_ratio_ps = log((party_votes_direct_ps + 1)/abstentions_ps)) %>%
+  # Select relevant variables
+  dplyr::select(polling_station, constituency, eligible_voters, abstentions_ps, party, party_votes_direct_ps, vote_share_direct_ps, log_vote_ratio_ps)
+
+
+# Second votes
+results21_polling_second <- election_data_granular %>%
+  # Select relevant columns (i.e., direct votes in BTW 2021, polling station, constituency)
+  dplyr::select(c(1, 10:12, 66:106)) %>%
+  rename_with(~ str_remove(.x, pattern = "...\\d+"), .cols = everything()) %>%
+  rename("constituency" = "Wahlkreis", "polling_station" = "Wahlbezirk", "station_type" = "Bezirksart", "eligible_voters" = "Wahlberechtigte (A)", "votes" = "Gültige", "cdu" = "CDU", "spd" = "SPD", "afd" = "AfD", "fdp" = "FDP", "linke" = "DIE LINKE", "gruene" = "GRÜNE", "csu" = "CSU") %>%
+  # Drop first column (i.e., denotes first and second votes; see data sheet)
+  filter(!is.na(constituency)) %>%
+  # Filter polling stations (we exclude mail-in stations and other special polling stations)
+  filter(station_type == 0) %>%
+  # Filter polling stations without eligible voters
+  filter(eligible_voters > 0) %>%
+  # Assign unique polling station number
+  mutate(polling_station = row_number()) %>%
+  # Change type to numeric
+  mutate(across(.cols = everything(), ~ as.numeric(.x))) %>%
+  rowwise() %>%
+  # Aggregate "others" and "union"
+  mutate(others = sum(c_across(c(-constituency, -polling_station, -station_type, -eligible_voters, -votes, -all_of(parties))), na.rm = TRUE),
+         union = sum(cdu, csu, na.rm = TRUE)) %>%
+  dplyr::select(constituency, polling_station, eligible_voters, votes, all_of(parties), union, others, -cdu, -csu) %>%
+  ungroup() %>%
+  # Change to long format for merging
+  pivot_longer(cols = spd:others, names_to = "party", values_to = "party_votes_second_ps") %>%
+  # Calculate vote share
+  mutate(vote_share_second_ps = party_votes_second_ps/votes) %>%
+  # Select relevant variables
+  dplyr::select(polling_station, constituency, party, party_votes_second_ps, vote_share_second_ps)
+
+# Join results
+results21_polling <- left_join(results21_polling_direct, results21_polling_second, by = c("polling_station", "party", "constituency"))
+
+```
+
+# Prepare constituency data
+
+```{r}
+
+# Preprocess constituency data
+structural_data <- constituency_data %>%
+  filter(!str_detect(constituency_name, "Land insgesamt|Insgesamt")) %>%
+  mutate(across(.cols = c(-state, -constituency_name), ~as.numeric(.x)),
+         across(.cols = c("pop_migrants", starts_with("age"), starts_with("area"), cars_EV, graduates_no_HS:graduates_highschool, starts_with("childcare"), starts_with("employed_"), starts_with("socialcare_"), starts_with("unemployment")), ~ .x/100),
+         east = ifelse(str_detect(state, pattern = "Brandenburg|Mecklenburg-Vorpommern|Sachsen|Sachsen-Anhalt|Thüringen"), 1, 0),
+         east = ifelse(constituency %in% c(75, 76, 83:86), 1, east))
+
+```
+
+# Prepare GESIS data
+
+```{r}
+
+# Define variables to select from GESIS
+vars_effort <- c("b2", "b3a", "b4", "b5")
+# Define variable names
+vars_names_effort <- c("effort_time_spent", "effort_team_size", "effort_consulting", "effort_budget")
+
+# Preprocess GESIS data
+gesis_candidates <- gesis_candidates %>%
+  select(-c(study:wei_mdb)) %>%
+  # Filter direct candidates
+  filter(kandidaturtyp != 1) %>%
+  mutate(
+    # create new party variable for matching
+    party = case_when(partei %in% c(1:3) ~ "union",
+                           partei == 4 ~ "spd",
+                           partei == 5 ~ "fdp",
+                           partei == 6 ~ "gruene",
+                           partei == 7 ~ "linke",
+                           partei == 322 ~ "afd"),
+    # Reformat constituency
+    constituency = ifelse(wknr > 0, wknr, NA)) %>%
+  # Select necessary variables
+  select(
+    party, constituency, # matching variables
+    a2a:a2e, # prior candidacy
+    all_of(vars_effort), # effort variables
+    b18 # News volume
+  ) %>%
+  # Rename variabels
+  rename_with(~ vars_names_effort, all_of(vars_effort)) %>% # effort
+  rename_with(~ str_c("candidacy_", c(2017, 2013, 2009, 2005, "before_2005")), a2a:a2e) %>% # candidacy
+  rename("news_volume_gesis" = "b18") %>%
+  # Reformat variables
+  mutate(
+    # Consulting efforts
+    effort_consulting = case_when(effort_consulting == 1 ~ 1,
+                                  effort_consulting == 2 ~ 0,
+                                  effort_consulting < 0 ~ as.numeric(NA)),
+    # Missing values
+    across(.cols = c(candidacy_2017:news_volume_gesis), ~ as.numeric(.x)),
+    across(.cols = c(candidacy_2017:news_volume_gesis), ~ ifelse(.x < 0, NA, .x)),
+    across(.cols = c(candidacy_2017:candidacy_before_2005), ~ ifelse(.x >= 2 , 1, ifelse(.x == 1, 0, .x))),
+    # Invert scale of news volume (1 = little coverage; 5 = high coverage)
+    news_volume_gesis = 6 - news_volume_gesis
+  )
+
+```
+
+# Create data frame of candidate variables
+
+```{r}
+
+candidates <- candidates %>%
+  left_join(election_results, by = c("constituency", "party")) %>%
+  left_join(gesis_candidates, by = c("party", "constituency")) %>%
+  mutate(
+    # Imputation for GESIS vars
+    # Median imputation
+    across(.cols = c(all_of(vars_names_effort), news_volume_gesis), ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x), .names = "{.col}_median_imp")
+    ) %>%
+  select(-c(surname, name, name_long:name_alt, party_off, party_long, year_birth, gender))
+
+```
+
+# Create model data frame
+
+```{r}
+
+# Variable names
+vars <- candidates %>% select(-candidate_id) %>% colnames()
+
+# Pivot ads by locations
+fb_candidates_loc <- fb_candidates %>%
+  right_join(candidates, by = c("candidate_id", "constituency", "party")) %>% # We join all candidates, including those without ads
+  rename_with(~ str_replace(.x, "\\-|\\+", "_"), .cols = starts_with("share_")) %>%
+  mutate(state = factor(state, levels = c("BY", "BW", "TH", "HE", "SL", "RP", "NW", "NI", "ST", "SN", "BB", "MV", "SH", "BE", "HH", "HB"), labels = states),
+         state = str_replace(state, "-", "_"),
+         ad_indicator = ifelse(is.na(ad_indicator), 0, ad_indicator)) %>%
+  pivot_longer(cols = c(Bremen:Mecklenburg_Vorpommern), names_to = "location_ad", values_to = "share_location") %>%
+  group_by(id) %>%
+  mutate(no_location = ifelse(sum(share_location, na.rm = TRUE) == 0, 1, 0),
+         share_location = ifelse(no_location == 0, share_location,
+                                 ifelse(state == location_ad, 1, share_location)),
+         across(.cols = c(impressions, audience, spend, impressions_lb, impressions_ub), ~ share_location * .x)
+         ) %>%
+  select(-no_location, -share_Unknown)
+  
+
+# Create model data frame
+df_model <- fb_candidates_loc %>%
+  # Filter ads by other parties
+  filter(party != "others") %>%
+  # Filter ads in home state
+  filter(state == location_ad) %>%
+  group_by(candidate_id) %>%
+  summarize(n_ads = n(),
+            across(.cols = c(impressions, audience, spend, impressions_lb, impressions_ub), ~ sum(.x, na.rm = TRUE)),
+            across(.cols = c(starts_with("share_"), sentiment), ~ mean(.x, na.rm = TRUE)),
+            across(.cols = c(candidate, ad_indicator, all_of(vars)), ~ dplyr::first(.x))) %>%
+  mutate(across(.cols = where(is.numeric), ~ ifelse(is.nan(.x), NA, .x)),
+         across(.cols = c(n_ads:sentiment), ~ if_else(ad_indicator == 0, 0, as.numeric(.x))),
+         across(.cols = c(impressions, audience, spend, n_ads, impressions_lb, impressions_ub), ~ as.vector(scale(.x, center = TRUE, scale = TRUE)), .names = "{.col}_std"),
+         across(.cols = c(impressions, audience, spend, n_ads), ~ log(.x), .names = "{.col}_log"),
+         across(.cols = ends_with("_log"), ~ ifelse(.x < 0, 0, .x))) %>%
+  mutate(performance = vote_share_direct - vote_share_second,
+         across(.cols = c(party, constituency, job, state), ~ as_factor(.x)))
+
+```
+
+# Handling missing values for gesis data
+
+```{r}
+
+# Variable groups for imputation
+fb_demo_vars <- fb_candidates %>% select(share_female, matches("share_\\d")) %>% colnames()
+
+# Median imputation
+df_model <- df_model %>%
+  mutate(
+    # Median imputation
+    across(.cols = c("sentiment", all_of(fb_demo_vars)), ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x), .names = "{.col}_median_imp"),
+    across(.cols = c(matches("effort_consulting_|news_volume_gesis_")), ~ as_factor(.x)))
+
+```
+
+# Save preprocessed datasets for analysis
+
+```{r}
+
+# Save candidate covariates
+write_csv(candidates, file = str_c(path_data, "misc/candidate_covariates.csv"))
+
+# Save election results for 2021
+write_csv(election_results, file = str_c(path_data, "misc/election_results_processed.csv"))
+
+# Save election results by polling station for 2021
+write_csv(results21_polling, file = str_c(path_data, "misc/election_results_by_polling_station_processed.csv"))
+
+# Save structural data
+write_csv(structural_data, file = str_c(path_data, "misc/structural_data_processed.csv"))
+
+# Save gesis data
+write_csv(gesis_candidates, file = str_c(path_data, "misc/gesis_canidates_processed.csv"))
+
+# Save facebook data by location
+write_csv(fb_candidates_loc, file = str_c(path_data, "fb_ad_library/processed/", "fb_candidates_loc.csv"))
+
+# Save final dataset for ad analysis
+write_csv(df_model, file = str_c(path_data, "df_model.csv"))
+
+```
+

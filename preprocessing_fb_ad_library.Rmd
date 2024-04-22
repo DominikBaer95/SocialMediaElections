@@ -1,0 +1,510 @@
+---
+title: "preprocessing_fb_ad_library"
+author: "Dominik Bär"
+date: "3/10/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set up environment
+
+```{r}
+
+# Clean environment
+rm(list = ls())
+
+# Load packages
+library(tidyverse)
+library(lubridate)
+library(stopwords)
+library(tidytext)
+
+# Set seed
+set.seed(42)
+
+# Define path to fb ad library data
+path_data <- "../data/fb_ad_library/"
+
+# Party names
+parties <- c("cdu", "csu", "spd", "afd", "fdp", "die linke", "grüne")
+# Federal states germany
+states <- c("Bayern", "Baden-Württemberg", "Thüringen", "Hessen", "Saarland", "Rheinland-Pfalz", "Nordrhein-Westfalen", "Niedersachsen", "Sachsen-Anhalt", "Sachsen", "Brandenburg", "Mecklenburg-Vorpommern", "Schleswig-Holstein", "Berlin", "Hamburg", "Bremen")
+
+```
+
+# Load raw fb ad library files
+
+```{r, include=FALSE, echo=FALSE}
+
+# Load facebook ad library data
+df_fb <- read_csv(str_c(path_data, "raw/", "fb_ads.csv")) %>%
+  select(-c("...1")) %>%
+  mutate(id = as.character(id),
+         page_id = as.character(page_id))
+
+# Load facebook ad library regional distribution
+df_fb_regions <- read_csv(str_c(path_data, "raw/", "fb_ads_regions.csv")) %>%
+  select(-c("...1")) %>%
+  mutate(id = as.character(id))
+
+# Load facebook ad library demographic distribution
+df_fb_demographics <- read_csv(str_c(path_data, "raw/", "fb_ads_demographics.csv")) %>%
+  select(-c("...1")) %>%
+  mutate(id = as.character(id))
+
+```
+
+# Load candidate list btw21 (we will assign party affiliation of ads based on this)
+
+```{r, include=FALSE, echo=FALSE}
+
+# Load candidate list
+candidates <- read_delim(str_c("../../data/misc/", "btw21_kandidaturen_utf8.csv"), delim = ";") %>%
+  rename_with(~str_remove_all(.x, ","), ends_with(",,")) %>%
+  rename("surname" = "Nachname", "name" = "Vornamen", "gender" = "Geschlecht", "year_birth" = "Geburtsjahr", "party_off" = "Gruppenname", "party_long" = "GruppennameLang", "constituency" = "Gebietsnummer", "direct_election" = "Kennzeichen", "election_list" = "VerknKennzeichen", "incumbent" = "VorpGewaehlt", "state" = "GebietLandAbk", "job" = "Berufsschluessel") %>%
+  select(surname, name, gender, year_birth, party_off, party_long, constituency, direct_election, election_list, incumbent, state, job)
+
+```
+
+# Preprocess candidate list
+
+```{r}
+
+# Preprocess candidate data
+candidates <- candidates %>%
+  mutate(party_off = ifelse(str_detect(party_off, "EB: "), "parteiunabhängig", party_off),
+         party_long = ifelse(str_detect(party_off, "parteiunabhängig"), "parteiunabhängig", party_long),
+         party_off = ifelse(str_detect(party_long, "bergpartei, die überpartei - ökoanarchistisch-realdadaistisches sammelbecken"), "bergpartei", party_off),
+         party_off = ifelse(str_detect(party_long, "Die Urbane"), "Die Urbane", party_off),
+         party_long = ifelse(str_detect(party_off, "CSU"), "Christilich-Soziale Union", party_long),
+         surname = str_replace_all(surname, "ǧ", "g"),
+         name_long = str_c(name, " ", surname),
+         name_short = str_c(str_extract(name, "([[:alpha:]]+)"), " ", surname),
+         name_alt = str_c(str_extract(name, "([[:alpha:]-]+)"), " ", surname),
+         across(.cols = c(party_off, party_long, name_long, name_short, name_alt), ~ str_to_lower(.x, locale = "de")),
+         direct_election = ifelse(direct_election == "Landesliste", 0, 1),
+         age = 2021 - year_birth, # we only have year of birth => footnote
+         female = ifelse(gender == "w", 1, 0), # there is one diverse person running for BT => Robustness Check?
+         election_list = if_else(election_list == "Landesliste", 1, 0, missing = 0),
+         incumbent = ifelse(str_detect(incumbent, "X"), 1, 0),
+         incumbent = ifelse(is.na(incumbent), 0, incumbent),
+         job = as_factor(job)) %>%
+  mutate(party = case_when(str_detect(party_off, "cdu|csu") == TRUE ~ "union",
+                           str_detect(party_off, "die linke") == TRUE ~ "linke",
+                           str_detect(party_off, "grüne") == TRUE ~ "gruene",
+                           !str_detect(party_off, "union|linke|spd|fdp|gruene|afd") == TRUE ~ "others"),
+         party = ifelse(is.na(party), party_off, party)) %>%
+  filter(direct_election == 1) %>%
+  mutate(candidate_id = row_number()) %>%
+  group_by(party_off) %>%
+  mutate(party_id = cur_group_id()) %>%
+  ungroup()
+
+```
+
+# Create vector to assign party affiliation of ads 
+
+```{r, include=FALSE, echo=FALSE}
+
+## Create vector of party names, youth organizations, and candidates for each party
+# CDU/CSU
+union <- candidates %>%
+  filter(party == "union") %>%
+  select(name_long, name_short, name_alt) %>%
+  flatten() %>%
+  unique() %>%
+  c(. , "cdu", "csu", "christlich demokratische union deutschlands", "christlich-soziale union", "junge union")
+
+union_pattern <- str_c(union, collapse = "|")
+
+# SPD
+spd <- candidates %>%
+  filter(party == "spd") %>%
+  select(name_long, name_short, name_alt) %>%
+  flatten() %>%
+  unique() %>%
+  c(. , "spd", "sozialdemokratische partei deutschlands", "jusos")
+
+spd_pattern <- str_c(spd, collapse = "|")
+
+# AfD
+afd <- candidates %>%
+  filter(party == "afd") %>%
+  select(name_long, name_short, name_alt) %>%
+  flatten() %>%
+  unique() %>%
+  c(. , "afd", "alternative für deutschland", "junge alternative für deutschland", "junge alternative")
+
+afd_pattern <- str_c(afd, collapse = "|")
+
+# FDP
+fdp <- candidates %>%
+  filter(party == "fdp") %>%
+  select(name_long, name_short, name_alt) %>%
+  flatten() %>%
+  unique() %>%
+  c(. , "fdp", "freie demokratische partei", "junge liberale")
+
+fdp_pattern <- str_c(fdp, collapse = "|")
+
+# Linke
+linke <- candidates %>%
+  filter(party == "linke") %>%
+  select(name_long, name_short, name_alt) %>%
+  flatten() %>%
+  unique() %>%
+  c(. , "die linke", "linksjugend", "\\[\\'solid\\]", "linksfraktion", "fraktion die linke")
+
+linke_pattern <- str_c(linke, collapse = "|")
+
+# Grüne
+gruene <- candidates %>%
+  filter(party == "gruene") %>%
+  select(name_long, name_short, name_alt) %>%
+  flatten() %>%
+  unique() %>%
+  c(. , "grüne", "bündnis 90/die grünen", "grüne jugend")
+
+gruene_pattern <- str_c(gruene, collapse = "|")
+
+# others
+others <- candidates %>%
+  filter(!(party_off %in% parties)) %>%
+  select(name_long, name_short, name_alt, party_off, party_long) %>%
+  flatten() %>%
+  unique() %>%
+  c(. , "liberal-konservative jugend", "hintnerjugend", "sozialistische deutsche arbeiterjugend", "junge nationalisten", "junge ökologen", "rebell", "junge freie wähler", "junge piraten", "parteifrei")
+
+others_pattern <- str_c(others, collapse = "|")
+
+```
+
+# Preprocessing fb ads
+
+```{r, include=FALSE, echo=FALSE}
+
+# Filter facebook ads and map on party names
+fb <- df_fb %>%
+  # Concatenate bylines and page_name for filtering
+  mutate(sponsor = str_c(str_replace_na(bylines), " ; ", str_replace_na(page_name))) %>%
+  # Filter by time  
+  filter(ad_delivery_start_time <= 	"2021-09-26" & ad_delivery_start_time >= "2021-04-26") %>%
+  # Handle data with no stop time for ad delivery
+  mutate(ad_delivery_stop_time = as_date(ifelse(is.na(ad_delivery_stop_time), ad_delivery_start_time, ad_delivery_stop_time))) %>%
+  # Reformat sponsor and remove distorting words
+  mutate(sponsor = str_to_lower(sponsor, locale = "de"),
+         sponsor = str_remove(sponsor, "wahlkreis|photovoltaik|tnt")) %>%
+  # Map ad to party
+  mutate(others = ifelse(str_detect(sponsor, others_pattern), 1, 0),
+         gruene = ifelse(str_detect(sponsor, gruene_pattern), 1, 0),
+         linke = ifelse(str_detect(sponsor, linke_pattern), 1, 0),
+         fdp = ifelse(str_detect(sponsor, fdp_pattern), 1, 0),
+         afd = if_else(str_detect(sponsor, afd_pattern), 1, 0),
+         spd = if_else(str_detect(sponsor, spd_pattern), 1, 0),
+         union = ifelse(str_detect(sponsor, union_pattern), 1, 0)) %>%
+  # Filter by if at least one keyword appeared (i.e. party/candidate names)
+  rowwise() %>%
+  mutate(total = sum(c(others, gruene, linke, fdp, afd, spd, union), na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(total > 0)
+
+## Some patterns are not unique (i.e. apply to several parties) we have to correct that manually.
+# Identify duplicates
+duplicates <- fb %>%
+  filter(total > 1)
+
+# Adjust party indicator according to duplicates
+fb <- fb %>%
+  mutate(sponsor = str_remove(sponsor, pattern = "wahlkreis"),
+         across(.cols = c(others, gruene, linke, fdp, afd, spd), ~ ifelse(str_detect(sponsor, "cdu|csu"), 0, .x)),
+         across(.cols = c(others, gruene, linke, fdp, afd, union), ~ ifelse(str_detect(sponsor, "spd |spd-"), 0, .x)),
+         across(.cols = c(others, gruene, linke, fdp, spd, union), ~ ifelse(str_detect(sponsor, "afd|junge alternative"), 0, .x)),
+         across(.cols = c(gruene, linke, fdp, afd, spd, union), ~ ifelse(str_detect(sponsor, "die partei "), 0, .x)),
+         across(.cols = c(others, gruene, linke, afd, spd, union), ~ ifelse(str_detect(sponsor, "fdp"), 0, .x)),
+         across(.cols = c(others, gruene, fdp, afd, spd, union), ~ ifelse(str_detect(sponsor, "linke"), 0, .x)),
+         across(.cols = c(others, linke, fdp, afd, spd, union), ~ ifelse(sponsor == "moritz alexander müller ; moritz müller", 0, .x)),
+         others = ifelse(sponsor == "jens zimmermann ; jens zimmermann", 0, others),
+         others = ifelse(page_name == "Michael Müller", 0, others),
+         others = ifelse(page_name == "Andreas Schwarz", 0, others),
+         others = ifelse(page_name == "Susanne Mittag", 0, others),
+         others = ifelse(page_name == "Die Grünen und Unabhängigen in Reutlingen", 0, others),
+         others = ifelse(sponsor == "jürgen braun mdb ; jürgen braun, mdb", 0, others),
+         others = ifelse(sponsor == "alexander müller mdb ; alexander müller", 0, others),
+         others = ifelse(sponsor == "stefan müller ; stefan müller", 0, others),
+         afd = ifelse(str_detect(sponsor, "philipp josef erich albrecht"), 0, afd),
+         fdp = ifelse(sponsor == "spd nordfriesland ; jens peter jensen", 0, fdp),
+         gruene = ifelse(sponsor == "tobias grünert ; cdu-vechelde", 0, gruene),
+         gruene = ifelse(sponsor == "stefan schmidt ; stefan schmidt - bürgermeister der stadt annaburg", 0, gruene),
+         spd = ifelse(page_name == "Martin Reichardt", 0, spd)) %>%
+  # Delete three observations as not uniquely identifiable which party runs ad
+  filter(page_name != "Stadtratsfraktion SPD/Volt München" & page_name != "Fraktionsgemeinschaft DIE LINKE/Die PARTEI im Chemnitzer Stadtrat")
+
+# Check should be empty df if all duplicates are removed
+check <- fb %>% 
+  rowwise() %>%
+  mutate(total = sum(c(others, gruene, linke, fdp, afd, spd, union), na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(total > 1)
+# => all duplicates removed
+
+# Some patterns wrongly identify sponsors which we also have to remove manually
+incorrect_pattern <- "audible|1stdibs|die familienunternehmer|ministerium für soziales, gesundheit, frauen und familie|familienbetriebe land und forst|deine sport familie|senatsverwaltung für bildung, jugend und familie|familienzentrum winsen|karriere im familienunternehmen|niklas schulz|stiftung familienunternehmen|familienbäckerei|stadt- und familienfest bad schwartau|familienservice lernwelten|bundesministerium für familie, senioren, frauen und jugend|northvolt|dezvoltare|ubp - union bancaire privée|wir lieben altenburg"
+
+fb <- fb %>%
+  filter(!str_detect(sponsor, incorrect_pattern))
+
+# Create categorical variable of party
+fb <- fb %>%
+  mutate(party = ifelse(others == 1, "others", NA),
+         party = ifelse(gruene == 1, "gruene", party),
+         party = ifelse(linke == 1, "linke", party),
+         party = ifelse(afd == 1, "afd", party),
+         party = ifelse(fdp == 1, "fdp", party),
+         party = ifelse(spd == 1, "spd", party),
+         party = ifelse(union == 1, "union", party))
+
+## FB ads are accompanied by regional and demographic distributions => we also have to filter those files
+# All ads are uniquely identified by id => filter by id
+relevant_ads <- fb %>% select(id, party, sponsor)
+
+# Filter regions
+fb_regions <- df_fb_regions %>%
+  right_join(relevant_ads, by = "id") %>%
+  mutate(region = ifelse(region == "Saxony-Anhalt", "Sachsen-Anhalt", region)) %>%
+  filter(region %in% states)
+
+# Filter demographics
+fb_demographics <- df_fb_demographics %>%
+  mutate(male = factor(ifelse(gender == "female", 0, 1), label = c("Female", "Male/Others")),
+         age_group = factor(age)) %>%
+  group_by(id, male, age_group) %>%
+  summarize(across(.cols = c(percentage, impressions_lb, impressions_ub), ~ sum(.x, na.rm = TRUE))) %>%
+  right_join(relevant_ads, by = "id") %>%
+  filter(!is.na(percentage)) %>%
+  filter(age_group != "All (Automated App Ads)" & age_group != "13-17" & age_group != "unknown")
+
+```
+
+# Add additional variables
+
+```{r, include = FALSE, echo=FALSE}
+
+## Demographics
+
+# Create female share per ad (Age groups > 18)
+female <- fb_demographics %>%
+  group_by(id, male) %>%
+  summarize(share_gender = sum(percentage)) %>%
+  filter(male == "Female") %>%
+  rename(share_female = share_gender) %>%
+  dplyr::select(-male)
+
+# Create age shares per ad
+age <- fb_demographics %>%
+  group_by(id, age_group) %>%
+  summarize(share_age = sum(percentage)) %>%
+  pivot_wider(names_from = age_group, 
+              values_from = share_age,
+              names_prefix = "share_") %>%
+  rename_with(~ str_replace(.x, "\\-|\\+", "_"), .cols = starts_with("share_"))
+
+# Note: 6 Ads have share of impressions with unknown age, yet this accounts for < 0.2% of all impressions
+
+# Create region share per ad
+region <- fb_regions %>%
+  select(id, region, percentage) %>%
+  pivot_wider(names_from = region,
+              values_from = percentage) %>%
+  rename_with(~ str_replace(.x, "-", "_"), .cols = everything())
+
+
+# Add demographics
+fb <- fb %>%
+  left_join(female, by = "id") %>%
+  left_join(age, by = "id") %>%
+  left_join(region, by = "id")
+
+## Aggregate impressions, audience size, spending per ad
+
+# Create additional variables (e.g., avg. impressions, audience, etc.)
+fb <- fb %>%
+  mutate(
+    # For more than 1 Mio impressions FB does not report upper bounds => use lower bound for conservative estimates
+    impressions_ub = ifelse(is.na(impressions_ub), impressions_lb, impressions_ub),
+    # For audience size greater than 1 Mio FB does not report upper bounds => use lower bound for conservative estimates
+    audience_ub = ifelse(is.na(audience_ub), audience_lb, audience_ub),
+    # Average number of impressions
+    impressions = (impressions_lb + impressions_ub) / 2,
+    # Average audience size
+    audience = (audience_lb + audience_ub) / 2,
+    # Average amount spend for ad (in Euro) 
+    spend = (spend_lb + spend_ub) / 2,
+    # Correct variables if ads are online after election
+    effect_election = as.numeric(ymd("2021-09-26") - ymd(ad_delivery_start_time) + 1) / as.numeric(ymd(ad_delivery_stop_time) - ymd(ad_delivery_start_time) + 1),
+    across(.cols = c(impressions, audience, spend), ~ ifelse(ad_delivery_stop_time > "2021-09-26", .x * effect_election, .x)),
+    # Factor indicating platform
+    platform = ifelse(facebook == 1 & instagram == 0, "Facebook", 0),
+    platform = ifelse(facebook == 0 & instagram == 1, "Instagram", platform),
+    platform = ifelse(facebook == 1 & instagram == 1, "Facebook and Instagram", platform),
+    platform = as_factor(platform)) %>%
+  select(-effect_election)
+
+# Remove some variables that are not relevant for the analysis
+fb <- fb %>%
+  select(-c(ad_creative_link_captions, ad_creative_link_titles, ad_snapshot_url, ad_creative_link_captions))
+
+```
+
+# Adjust spend for ads in USD
+
+```{r}
+
+exchange_rates <- read_delim(file = "../../data/misc/exchange_rate_USDEUR.csv", delim = ";", col_names = c("date", "rate", "comment"), col_select = c(date, rate)) %>%
+  mutate(rate = ifelse(str_detect(".", rate), NA, rate),
+         rate = as.numeric(str_replace(rate, ",", "."))) %>%
+  filter(date >= "2021-04-26" & date <= "2021-09-26") %>%
+  tidyr::fill(rate, .direction = "down")
+
+fb <- fb %>%
+  left_join(exchange_rates, by = c("ad_delivery_stop_time" = "date")) %>%
+  mutate(across(.cols = c(spend, spend_lb, spend_ub), ~ ifelse(currency == "USD", .x/rate, .x))) %>%
+  select(-rate)
+
+```
+
+# Sentiment analysis
+
+```{r}
+
+files_SentiWS <- str_c("../../data/misc/SentiWS/SentiWS_v2.0_", c("Negative", "Positive"), ".txt")
+
+# Prepare SentiWS dictionary
+SentiWS <- files_SentiWS %>%
+  map(~ read_delim(.x, delim = "\t", col_names = c("word", "polarity", "inflection")) %>%
+        mutate(word = str_remove(word, pattern = ("\\|.*")),
+               inflection = str_replace_na(inflection, " "),
+               word = str_c(word, inflection, sep = ","),
+               word = str_remove(word, ",[:space:]"),
+               word = str_split(word, pattern = ",")) %>%
+        unnest(word) %>%
+        select(-inflection)) %>%
+  bind_rows()
+
+stopwords_german <- tibble(word = stopwords(language = "de"))
+
+test <- SentiWS %>% group_by(word) %>% filter(n()>1)
+
+# Compute sentiment
+df_sentiment <- fb %>%
+  filter(languages == "de") %>%
+  select(id, ad_creative_bodies) %>%
+  mutate(# Remove handles
+         body = str_replace_all(ad_creative_bodies, "@[a-z,A-Z,0-9]*", ""),
+         # Remove punctuation and non-alphanumeric characters
+         body = str_replace_all(body, "[^[:alnum:][:space:][äüö]]", ""),
+         # Remove multiple spaces
+         body = str_replace_all(body, "\\s+", " ")) %>%
+  unnest_tokens(token, body, to_lower = FALSE) %>%
+  anti_join(tibble(word = stopwords::stopwords("de")), by = c("token" = "word")) %>%
+  left_join(SentiWS, by = c("token" = "word")) %>%
+  filter(!is.na(polarity)) %>%
+  group_by(id) %>%
+  summarize(sentiment = mean(polarity))
+
+# Join sentiment with other data
+fb <- fb %>% left_join(df_sentiment, by = "id")
+
+```
+
+# Create file only containing candidate ads
+
+```{r}
+
+# Duplicated candidate names make matching for all party at once tricky.
+# We thus split the dataframe by party and match each party on their own.
+
+# Create dataframe of candidates and constituency for each party for joining
+join_df <- candidates %>%
+  select(name_long, name_short, name_alt, party, candidate_id, constituency) %>%
+  split(f = as.factor(.$party)) %>%
+  map(~ .x %>% select(-party))
+
+# Create regex patterns for each party to identify corresponding candidates in FB ads data
+patterns <- join_df %>%
+  map(~ .x %>% 
+        select(name_long, name_short, name_alt) %>%
+        flatten() %>%
+        unique() %>%
+        str_c(. , collapse = "|"))
+  
+# Identify ads by candidates for each party and match constituency
+fb_candidates <- fb %>%
+  split(f = as.factor(.$party)) %>%
+  map2(.y = patterns, ~ .x %>% mutate(candidate = str_extract(sponsor, pattern = .y))) %>%
+  map(~ .x %>% filter(!is.na(candidate))) %>%
+  map2(.y = join_df, ~ .x %>% left_join(.y, by = c("candidate" = "name_long")) %>%  select(-name_short, -name_alt)) %>%
+  map2(.y = join_df, ~ .x %>% left_join(.y, by = c("candidate" = "name_short")) %>%  select(-name_long, -name_alt)) %>%
+  map2(.y = join_df, ~ .x %>% left_join(.y, by = c("candidate" = "name_alt")) %>%  select(-name_long, -name_short)) %>%
+  bind_rows() %>%
+  mutate(candidate_id = coalesce(candidate_id, candidate_id.x, candidate_id.y),
+         constituency = coalesce(constituency, constituency.x, constituency.y),
+         ad_indicator = 1) %>%
+  select(-ends_with(".x"), -ends_with(".y"))
+
+# Some candidates are identified by short and long name => we find the same candidate listed twice in a constituency
+check <- fb_candidates %>%
+  distinct(candidate, constituency, party) %>%
+  group_by(constituency, party) %>%
+  filter(n()>1)
+
+fb_candidates <- fb_candidates %>%
+  group_by(constituency, party) %>%
+  mutate(candidate = ifelse(party != "others", first(candidate), candidate),
+         candidate = ifelse(candidate == "markus rainer lappe", "markus lappe", candidate),
+         candidate = ifelse(candidate == "gerhard heinrich wenderoth", "gerhard wenderoth", candidate),
+         candidate = ifelse(candidate == "thomas jürgen lebkücher", "thomas lebkücher", candidate),
+         candidate = ifelse(candidate == "philipp johannes drabinski", "philipp drabinski", candidate),
+         candidate = ifelse(candidate == "felix johannes locke", "felix locke", candidate)) %>%
+  ungroup()
+  
+check <- fb_candidates %>%
+  distinct(candidate, constituency, party) %>%
+  group_by(constituency, party) %>%
+  filter(n()>1) %>%
+  arrange(constituency)
+# Only others are left (but with different names) => we adjusted names for those who appear twice for one constituency 
+
+# Some candidates are matched with ads by candidates running for Berlin election
+remove_candidates <- "wiebke neumann|sebastian walter"
+
+fb_candidates <- fb_candidates %>%
+  filter(!str_detect(candidate, remove_candidates))
+
+# Number of direct candidates identified:
+nrow(fb_candidates %>% distinct(candidate_id))
+
+# candidates without facebook page
+missing <- candidates %>%
+  filter(direct_election == 1) %>%
+  anti_join(fb_candidates, by = "candidate_id")
+
+```
+
+# Save processed file
+
+```{r, include=FALSE, echo=FALSE}
+
+# Save preprocessed ad library files
+write_csv(fb, file = str_c(path_data, "processed/", "fb.csv"))
+write_csv(fb_regions, file = str_c(path_data, "processed/", "fb_regions.csv"))
+write_csv(fb_demographics, file = str_c(path_data, "processed/", "fb_demographics.csv"))
+write_csv(fb_candidates, file = str_c(path_data, "processed/", "fb_candidates.csv"))
+
+# Save preprocessed candidate files
+write_csv(candidates, file = str_c("../../data/", "misc/btw21_candidates_processed.csv"))
+
+```
+

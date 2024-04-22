@@ -1,0 +1,1110 @@
+---
+title: "analysis - ad effect"
+author: "Dominik Bär"
+date: '2022-07-22'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# File description
+
+```{r}
+
+# This file contains the analysis of Meta ads on election outcomes
+
+```
+
+# Set up environment
+
+```{r, include=FALSE, echo=FALSE}
+
+# Clean environment
+rm(list = ls())
+
+# Load packages
+library(tidyverse)
+library(lubridate)
+library(viridis)
+library(betareg)
+library(ivreg)
+library(systemfit)
+library(REndo)
+library(broom)
+library(lmtest)
+library(sandwich)
+library(ggeffects)
+library(ggpubr)
+library(ggh4x)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(sf)
+library(sensemakr)
+
+source("utils.R")
+
+# Set seed
+set.seed(42)
+
+# Define paths to data
+path_data <- "../data/"
+path_figures <- "../doc/Nat Comms/figures/"
+
+# Party names
+parties <- c("cdu", "csu", "spd", "afd", "fdp", "linke", "gruene")
+# Party colors
+parties_colors <- c("#e3000f", "#000000", "#46962b", "#ffed00", "#009ee0", "#b61c3e")
+# Federal states germany
+states <- c("Bayern", "Baden-Württemberg", "Thüringen", "Hessen", "Saarland", "Rheinland-Pfalz", "Nordrhein-Westfalen", "Niedersachsen", "Sachsen-Anhalt", "Sachsen", "Brandenburg", "Mecklenburg-Vorpommern", "Schleswig-Holstein", "Berlin", "Hamburg", "Bremen")
+
+```
+
+# Texreg utils
+
+```{r}
+
+# Coefficient names
+coef_names_main <- list("(Intercept)" = "Intercept", "impressions_std" = "Impressions", "spend_std" = "Ad spending", "n_ads_std" = "Number of ads", "audience_std" = "Audience", "vote_share_second" = "Vote share: Party vote", "vote_share_direct17" = "Vote share: Previous election", "incumbent1" = "Incumbent")
+coef_names_candidate <-list("age" = "Age", "female1" = "Female", "election_list1" = "On election list")
+coef_names_constituency <- list("pop_migrants" = "Migrant stock", "pop_dens" = "Population denisty", "unemployment" = "Unemployment rate")
+coef_names_fb <- list("share_female_median_imp" = "Female viewers", "share_18_24_median_imp" = "Age group: 18 - 24", "share_25_34_median_imp" = "Age group: 25 - 34", "share_35_44_median_imp" = "Age group: 35 - 44", "share_45_54_median_imp" = "Age group: 45 - 54", "share_55_64_" = "Age group: 55 - 64", "share_65_" = "Age group: 65 +") 
+coef_names_gesis_rf <- list("effort_time_spent_rf_imp" = "Effort: Time spent (h/week)", "effort_team_size_rf_imp" = "Effort: Team size", "effort_consulting_rf_imp" = "Effort: Consulting ($=1$ if yes)", "effort_budget_rf_imp" = "Effort: Budget (EUR)")
+coef_names_gesis_mean <- list("effort_time_spent_mean_imp" = "Effort: Time spent (h/week)", "effort_team_size_mean_imp" = "Effort: Team size", "effort_budget_mean_imp" = "Effort: Budget (EUR)")
+coef_names_gesis_median <- list("effort_time_spent_median_imp" = "Effort: Time spent (h/week)", "effort_team_size_median_imp" = "Effort: Team size", "effort_consulting_median_imp1" = "Effort: Consulting ($=1$ if yes)", "effort_budget_median_imp" = "Effort: Budget (EUR)")
+
+# Adjusted R-squared
+adj.rsq <- function(model_names){
+  
+  adj.rsqured <- map(model_names, ~ if(is.null(summary(.x)$adj.r.squared)){
+    # If statement produced warning, but output correct => can be ignored
+    summary(.x, type = "deviance")$pseudo.r.squared}
+    else {
+      summary(.x)$adj.r.squared
+  })
+  x <- sprintf("%.3f", round(unlist(adj.rsqured), digits = 3))
+  return(x)
+  }
+# Number of observations
+n_obs <- function(model_names){map(model_names, ~ length(.x$residuals))}
+
+```
+
+# Graph theme setup
+
+```{r}
+
+theme_set(
+  theme_bw() +
+    theme(legend.position = c(0.7, 0.9),
+          legend.title = element_blank(), 
+          legend.direction = "horizontal",
+          legend.text = element_text(colour="black", size=12), 
+          legend.background=element_rect(fill="transparent", colour=NA),
+          legend.key = element_rect(fill = "transparent", colour = "transparent"),
+          legend.key.width = unit(0.5, "cm"), 
+          legend.key.height = unit(0.5, "cm")
+    ) + 
+    theme(axis.text.x=element_text(colour = "black", size=12, vjust=0.5), 
+          axis.text.y=element_text(colour = "black", size=12, vjust=0.5),
+          axis.title.x=element_text(size=12), 
+          axis.title.y=element_text(size=12, vjust=1.5)
+    )
+)
+
+```
+
+# Load data
+
+```{r, include=FALSE, echo=FALSE}
+
+# Load candidate covariates
+candidates <- read_csv(str_c(path_data, "misc/candidate_covariates.csv")) %>%
+  mutate(across(.cols = c(constituency, job, incumbent, female, election_list, matches("effort_consulting_")), ~ as_factor(.x)))
+
+# Load facebook data
+fb_candidates <- read_csv(str_c(path_data, "fb_ad_library/processed/", "fb_candidates.csv"))
+fb_candidates_loc <- read_csv(str_c(path_data, "fb_ad_library/processed/", "fb_candidates_loc.csv")) # by location
+
+# Load model data frame (all direct canidates)
+df_model <- read_csv(str_c(path_data, "df_model.csv")) %>%
+  mutate(across(.cols = c(constituency, job, incumbent, female, election_list, matches("effort_consulting_")), ~ as_factor(.x)))
+
+# Load election results by polling station (for two-party design)
+results21_polling <- read_csv(str_c(path_data, "misc/election_results_by_polling_station_processed.csv")) %>%
+  mutate(across(.cols = c(polling_station, constituency), ~ as_factor(.x)))
+
+```
+
+# Regression models
+## Construct control variables
+
+```{r}
+
+# Age distribution of FB/IG impressions 
+age_vars <- fb_candidates %>% select(matches("share_\\d")) %>% colnames() %>% str_c("_median_imp")
+
+# Regional distribution of FB/IG impressions
+region_vars <- fb_candidates %>% select(Bremen:Mecklenburg_Vorpommern) %>% colnames()
+
+# Candidate control variables
+candidate_vars <- c("age", "female", "election_list", "job")
+
+# Constituency control variables
+constituency_vars <- c("pop_migrants", "pop_dens", "unemployment")
+
+# GESIS control variables
+#gesis_vars_rf_imp <- df_model %>% select(starts_with("effort_") & ends_with("rf_imp")) %>% names()
+gesis_vars <- candidates %>% select(starts_with("effort_") & !ends_with("_imp")) %>% names
+gesis_vars_median_imp <- candidates %>% select(starts_with("effort_") & ends_with("median_imp")) %>% names()
+gesis_vars_mean_imp <- candidates %>% select(starts_with("effort_") & ends_with("mean_imp")) %>% names()
+
+# Load map data (for IV)
+geom_constituency <- read_sf(dsn = str_c(path_data, "misc/btw21_geometrie_wahlkreise/Geometrie_Wahlkreise_20DBT_VG250_geo.shp")) %>%
+  mutate(constituency = factor(WKR_NR))
+
+```
+
+## Main analysis
+# Linear regression
+
+```{r}
+
+## Impressions
+model_impressions <- lm(make_formula("vote_share_direct", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = df_model)
+
+inference_impressions <- coeftest(model_impressions, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out_impressions <- broom::tidy(inference_impressions, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_impressions, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out_impressions
+
+```
+
+# Candidate choice model (see Bekkouche et. al. 2022)
+
+```{r}
+
+## Impressions
+model_choice <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = df_model)
+
+inference_choice <- coeftest(model_choice, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out_choice <- broom::tidy(inference_choice, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_choice, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out_choice
+
+```
+
+# Visualization: Main model
+
+```{r}
+
+# Vector for plotting
+v <- c(min(df_model$impressions_std), seq(0, 15, 1), max(df_model$impressions_std))
+
+## Visualization: Effect plot, main effect, linear model
+# Prepare data
+df_plot <- ggeffect(model_impressions, terms = "impressions_std [v]", ci.lvl = 0.95, vcov. = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party) %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(ggeffect(model_impressions, terms = "impressions_std [v]", ci.lvl = 0.99, vcov. = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high") %>%
+  pivot_longer(cols = starts_with("conf"), names_pattern = "(.*)(..)$", names_to = c("limit", "conf.level")) %>%
+  pivot_wider(names_from = limit, values_from = value, names_repair = "check_unique") %>%
+  mutate(y = (x * sd(df_model$impressions) + mean(df_model$impressions)))
+  
+# Plot
+plot_effect <- ggplot(data = df_plot) +
+  geom_line(aes(y, predicted), color = "#D7191C") +
+  geom_ribbon(aes(y, predicted, ymin = conf.low., ymax = conf.high., fill = conf.level, alpha = conf.level)) +
+  scale_fill_manual(values = c("#D7191C", "#D7191C"), labels = c(expression(alpha ~ " = 95 %"), expression(alpha ~ " = 99 %"))) +
+  scale_alpha_discrete(range = c(0.4, 0.15), labels = c(expression(alpha ~ " = 95 %"), expression(alpha ~ " = 99 %"))) +
+  scale_x_continuous(
+  breaks = seq(0, 4000000, 1000000),
+  labels = c("0", "1 Mio", "2 Mio", "3 Mio", "")
+  ) +
+  scale_y_continuous(
+    breaks = seq(0.15, 0.21, 0.01),
+    labels = c("", "16 %", "", "18 %", "", "20 %", ""),
+    limits = c(0.15, 0.21),
+  ) +
+  theme(legend.position = "none",
+        legend.direction = "vertical",
+        legend.margin=margin(t=0, r=0, b=0, l=0, unit="cm"),
+        panel.grid.minor.x = element_blank()) +
+  labs(fill = "Impressions", alpha = "Impressions") +
+  xlab("Impressions") +
+  ylab("Vote share") +
+  force_panelsizes(rows = unit(9, "cm"),
+                   cols = unit(10, "cm"))
+
+plot_effect
+ggsave(str_c(path_figures, "regression_effect_plot.pdf"), width = 15, height = 12, units = "cm")
+
+## Visualization: Effect plot, main effect, discrete choice model
+# Prepare data
+df_plot <- ggeffect(model_choice, terms = "impressions_std [v]", ci.lvl = 0.95, vcov. = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party) %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(ggeffect(model_choice, terms = "impressions_std [v]", ci.lvl = 0.99, vcov. = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high") %>%
+  pivot_longer(cols = starts_with("conf"), names_pattern = "(.*)(..)$", names_to = c("limit", "conf.level")) %>%
+  pivot_wider(names_from = limit, values_from = value, names_repair = "check_unique") %>%
+  mutate(y = (x * sd(df_model$impressions) + mean(df_model$impressions)))
+  
+# Plot
+plot_effect <- ggplot(data = df_plot) +
+  geom_line(aes(y, predicted), color = "#D7191C") +
+  geom_ribbon(aes(y, predicted, ymin = conf.low., ymax = conf.high., fill = conf.level, alpha = conf.level)) +
+  scale_fill_manual(values = c("#D7191C", "#D7191C"), labels = c(expression(alpha ~ " = 95 %"), expression(alpha ~ " = 99 %"))) +
+  scale_alpha_discrete(range = c(0.4, 0.15), labels = c(expression(alpha ~ " = 95 %"), expression(alpha ~ " = 99 %"))) +
+  scale_x_continuous(
+  breaks = seq(0, 4000000, 1000000),
+  labels = c("0", "1", "2", "3", "")
+  ) +
+  scale_y_continuous(
+    breaks = seq(-1, -0.4, 0.1),
+    labels = c("-1", "", "-0.8", "", "-0.6", "", "-0.4"),
+  ) +
+  theme(legend.position = "none",
+        legend.direction = "vertical",
+        legend.margin=margin(t=0, r=0, b=0, l=0, unit="cm"),
+        panel.grid.minor.x = element_blank()) +
+  labs(fill = "Impressions", alpha = "Impressions") +
+  xlab("Impressions (in millions)") +
+  ylab(expression(ln(Votes/Abstensions))) +
+  force_panelsizes(rows = unit(9, "cm"),
+                   cols = unit(10, "cm"))
+
+plot_effect
+ggsave(str_c(path_figures, "regression_effect_plot_choice.pdf"), width = 15, height = 12, units = "cm")
+
+# Extract legend
+leg_impressions <- get_legend(plot_effect)
+
+```
+
+## Robustness check: Seemingly unrelated regression (see Bekkouche et. al. 2022)
+
+```{r}
+
+# Check for fully contested constituencies: 299 constituencies with 6 major parties 
+test <- df_model %>% select(constituency, party, candidate_id) %>% group_by(constituency) %>% filter(n()>6) %>% distinct(constituency)
+# => 290 constituencies are fully contested
+
+df_model_sur <- df_model %>%
+  # Filter fully contested constituencies
+  group_by(constituency) %>%
+  filter(n()==6) %>%
+  # Select model variables
+  select(log_vote_ratio, impressions_std, vote_share_second, vote_share_direct17, party, constituency, incumbent, gesis_vars_median_imp) %>%
+  # Split by party
+  group_by(party) %>%
+  group_split() %>%
+  map(~ {
+    party_name <- unique(.x$party)
+    rename_with(.x, ~ str_c(.x, "_", party_name), .cols = c(-constituency))}) %>%
+  reduce(left_join, by = "constituency") %>%
+  # Add constituency controls
+  left_join(structural_data, by = "constituency")
+
+# Create vectors of covariates
+impressions_cov <- df_model_sur %>% select(starts_with("impressions_std")) %>% colnames()
+incumbent_cov <- df_model_sur %>% select(starts_with("incumbent")) %>% colnames()
+vote_share_cov <- df_model_sur %>% select(matches("vote_share_second_|vote_share_direct17_")) %>% colnames()
+gesis_cov <- df_model_sur %>% select(matches("median_imp")) %>% colnames()
+constiteuncy_cov <- df_model_sur %>% select(unemployment, pop_migrants, pop_dens, starts_with("age"), graduates_highschool, east) %>% colnames()
+
+eq <- df_model %>% distinct(party) %>% pull()
+sur_eq <- vector(mode = "list", length = length(eq))
+
+for (party in 1:length(eq)) {
+  party_name <- eq[party]
+  sur_eq[[party]] <- make_formula(str_c("log_vote_ratio_", party_name), impressions_cov, c(str_c("vote_share_second_", party_name), str_c("vote_share_direct17_", party_name), incumbent_cov, gesis_cov))
+}
+
+# Estimate system of eqautions using SUR and FGLS
+model_sur <- systemfit(sur_eq, data = df_model_sur, method = "SUR", maxiter = 1000)
+
+```
+
+## Robustness check: Beta regression
+
+```{r}
+
+# Impressions
+model_beta <- betareg(make_formula("vote_share_direct", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent")),
+                      link = "log",
+                      data = df_model)
+
+inference_beta <- coeftest(model_beta, vcov = vcovCL, cadjust = TRUE, type = "HC0", cluster = ~ party)
+
+# Model summary
+out <- broom::tidy(inference_beta, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_beta, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out
+
+```
+
+## Robustness check: Alternative explanatory variables
+
+```{r}
+
+## Spending
+model_spending <- lm(make_formula("log_vote_ratio", "spend_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = df_model)
+
+inference_spending <- coeftest(model_spending, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out_spending <- broom::tidy(inference_spending, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_spending, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out_spending
+
+# Number of ads
+model_ads <- lm(make_formula("log_vote_ratio", "n_ads_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = df_model)
+
+inference_ads <- coeftest(model_ads, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out_ads <- broom::tidy(inference_ads, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_ads, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out_ads
+
+```
+
+# Visualization: Different explanatory variables
+
+```{r}
+
+# Visualization
+df_plot <- filter(out_choice, term == "impressions_std") %>%
+  rbind(filter(out_spending, term == "spend_std")) %>%
+  rbind(filter(out_ads, term == "n_ads_std")) %>%
+  mutate(term = factor(term, levels = c("impressions_std", "spend_std", "n_ads_std"), labels = c("Impressions", "Ad spending", "Number of ads")))
+
+# Plot coefficients
+coeff_plot <- ggplot(data = df_plot) +
+  geom_pointrange(aes(x = term, y = estimate, fill = term, color = term, ymin = conf.low.95, ymax = conf.high.95), position = position_dodge(width = 0.75), linewidth = 1.5, size = 1.5, shape = 21) +
+  geom_pointrange(aes(x = term, y = estimate, fill = term, color = term, ymin = conf.low.99, ymax = conf.high.99), position = position_dodge(width = 0.75), linewidth = 1, size = 1, shape = 21) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  coord_flip() + labs(x = "", y = "") +
+  scale_x_discrete(limits = rev) +
+  scale_y_continuous(
+    limits = c(0, 0.04) ,
+    breaks = seq(0, 0.04, 0.01),
+    labels = c("0", "0.01", "0.02", "0.03", "0.04")
+  ) +
+  scale_fill_manual(values = c("#D7191C", "#6baed6", "#B2DA80")) +
+  scale_color_manual(values = c("#D7191C", "#6baed6", "#B2DA80")) +
+  theme(legend.position = "none",
+        plot.margin = grid::unit(c(2, 3, 1, 2), "mm"),
+        panel.grid.minor = element_blank(),
+        text = element_text(size = 18)) +
+  ylab("Coefficient") +
+  force_panelsizes(rows = unit(8, "cm"),
+                   cols = unit(10.8, "cm"))
+
+coeff_plot
+ggsave(coeff_plot, filename = str_c(path_figures, "regression_coeff_plot.pdf"), width = 17, height = 10, units = "cm")
+
+## Visualization: Effect plot, spending
+# Prepare data
+v <- c(min(df_model$spend_std), seq(0, 15, 1), max(df_model$spend_std))
+
+df_plot <- ggeffect(model_spending, terms = "spend_std [v]", ci.lvl = 0.95, vcov. = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party) %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(ggeffect(model_spending, terms = "spend_std [v]", ci.lvl = 0.99, vcov. = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high") %>%
+  mutate(var = "spend") %>%
+  pivot_longer(cols = starts_with("conf"), names_pattern = "(.*)(..)$", names_to = c("limit", "conf.level")) %>%
+  pivot_wider(names_from = limit, values_from = value, names_repair = "check_unique") %>%
+  mutate(y = (x * sd(df_model$spend)) + mean(df_model$spend))
+  
+# Plot (Spending only)
+plot_effect <- ggplot(data = df_plot) +
+  geom_line(aes(y, predicted), color = "#6baed6") +
+  geom_ribbon(aes(y, predicted, ymin = conf.low., ymax = conf.high., fill = conf.level, alpha = conf.level)) +
+  scale_fill_manual(values = c("#6baed6", "#6baed6"), labels = c(expression(alpha ~ " = 95 %"), expression(alpha ~ " = 99 %"))) +
+  scale_alpha_discrete(range = c(0.4, 0.15), labels = c(expression(alpha ~ " = 95 %"), expression(alpha ~ " = 99 %"))) +
+  scale_x_continuous(
+    breaks = seq(0, 35000, 5000),
+    labels = c("0", "", "10,000", "", "20,000", "", "30,000", ""),
+  ) +
+  theme(legend.position = "none",
+        legend.direction = "vertical",
+        legend.margin=margin(t=0, r=0, b=0, l=0, unit="cm"),
+        panel.grid.minor.x = element_blank()) +
+  labs(fill = "Ad spending", alpha = "Ad spending") +
+  xlab("Ad spending (in EUR)") +
+  ylab(expression(ln(Votes/Abstensions))) +
+  force_panelsizes(rows = unit(9, "cm"),
+                   cols = unit(10, "cm"))
+
+plot_effect
+ggsave(str_c(path_figures, "regression_effect_plot_spending.pdf"), width = 15, height = 12, units = "cm")
+
+## Visualization: Effect plot, number of ads
+# Prepare data
+v <- c(min(df_model$n_ads_std), seq(0, 15, 1), max(df_model$n_ads_std))
+
+df_plot <- ggeffect(model_ads, terms = "n_ads_std [v]", ci.lvl = 0.95, vcov. = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party) %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(ggeffect(model_ads, terms = "n_ads_std [v]", ci.lvl = 0.99, vcov. = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high") %>%
+  mutate(var = "spend") %>%
+  pivot_longer(cols = starts_with("conf"), names_pattern = "(.*)(..)$", names_to = c("limit", "conf.level")) %>%
+  pivot_wider(names_from = limit, values_from = value, names_repair = "check_unique") %>%
+  mutate(y = (x * sd(df_model$n_ads)) + mean(df_model$n_ads))
+  
+# Plot (Number of ads only)
+plot_effect <- ggplot(data = df_plot) +
+  geom_line(aes(y, predicted), color = "#E8DA99") +
+  geom_ribbon(aes(y, predicted, ymin = conf.low., ymax = conf.high., fill = conf.level, alpha = conf.level)) +
+  scale_fill_manual(values = c("#E8DA99", "#E8DA99"), labels = c(expression(alpha ~ " = 95 %"), expression(alpha ~ " = 99 %"))) +
+  scale_alpha_discrete(range = c(0.4, 0.15), labels = c(expression(alpha ~ " = 95 %"), expression(alpha ~ " = 99 %"))) +
+  scale_x_continuous(
+    breaks = seq(0, 600, 100),
+    labels = c("0", "", "200", "", "400", "", "600"),
+  ) +
+  theme(legend.position = "none",
+        legend.direction = "vertical",
+        legend.margin=margin(t=0, r=0, b=0, l=0, unit="cm"),
+        panel.grid.minor.x = element_blank()) +
+  labs(fill = "Number of ads", alpha = "Number of ads") +
+  xlab("Number of ads") +
+  ylab(expression(ln(Votes/Abstensions))) +
+  force_panelsizes(rows = unit(9, "cm"),
+                   cols = unit(10, "cm"))
+
+plot_effect
+ggsave(str_c(path_figures, "regression_effect_plot_n_ads.pdf"), width = 15, height = 12, units = "cm")
+
+```
+
+## Robustness check: Additional control variables
+
+```{r}
+
+# Additional controls: Candidate controls
+model_candidates <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", candidate_vars, gesis_vars_median_imp)),
+                       data = df_model)
+
+inference_candidates <- coeftest(model_candidates, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out <- broom::tidy(inference_candidates, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_candidates, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out
+
+# Additional controls: News volume
+model_news <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", "news_volume_gesis_median_imp", gesis_vars_median_imp)),
+   data = df_model)
+
+inference_news <- coeftest(model_news, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out <- broom::tidy(inference_news, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_news, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out
+
+# Additional controls: Facebook variables
+model_fb <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", "share_female_median_imp", age_vars, gesis_vars_median_imp)),
+               data = df_model)
+
+inference_fb <- coeftest(model_fb, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out <- broom::tidy(inference_fb, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_fb, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out
+
+# Additional controls: Sentiment
+model_sentiment <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", "sentiment_median_imp", gesis_vars_median_imp)),
+   data = df_model)
+
+inference_sentiment <- coeftest(model_sentiment, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out <- broom::tidy(inference_sentiment, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_sentiment, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out
+
+# Additional controls: All control variables
+model_full <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", candidate_vars, "news_volume_gesis_median_imp", "share_female_median_imp", age_vars, "sentiment_median_imp", gesis_vars_median_imp)),
+               data = df_model)
+
+inference_full <- coeftest(model_full, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out <- broom::tidy(inference_full, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_full, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out
+
+```
+
+## Robustness check: Alternative dependent variable
+
+```{r}
+
+## Impressions
+model_performance <- lm(make_formula("performance", "impressions_std", c("vote_share_direct17", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = df_model)
+
+inference_performance <- coeftest(model_performance, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out <- broom::tidy(inference_performance, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_performance, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out
+
+```
+
+## Robustness check: Exclude impressions of last week to account for mail-in ballots
+
+```{r}
+
+# Create daily dataframe and filter observations before last week
+df_time <- fb_candidates_loc %>%
+  filter(party != "others") %>%
+  filter(state == location_ad) %>%
+  filter(ad_indicator == 1) %>%
+  mutate(ad_delivery_stop_time = if_else(is.na(ad_delivery_stop_time), ymd(ad_delivery_start_time), ymd(ad_delivery_stop_time)),
+         delivered = map2(ad_delivery_start_time, ad_delivery_stop_time, `:`)) %>%
+  unnest(cols = c(delivered)) %>%
+  mutate(delivered = as_date(delivered)) %>%
+  filter(delivered <= "2021-09-26") %>%
+  group_by(id) %>%
+  mutate(impressions = impressions/n()) %>%
+  filter(delivered <= "2021-09-19") %>%
+  rename_with(~ str_replace(.x, "\\-|\\+", "_"), .cols = starts_with("share_")) %>%
+  group_by(candidate_id) %>%
+  summarize(across(.cols = c(impressions, audience, spend), ~ sum(.x, na.rm = TRUE)),
+            across(.cols = starts_with("share_"), ~ mean(.x, na.rm = TRUE))) %>%
+  mutate(time_indicator = 1) %>%
+  right_join(candidates %>% filter(party != "others"), by = "candidate_id") %>%
+  mutate(across(c(impressions, audience, spend), ~ ifelse(is.na(time_indicator), 0, .x)),
+         across(.cols = where(is.numeric), ~ ifelse(is.nan(.x), NA, .x)),
+         across(.cols = c(impressions, audience, spend), ~ as.vector(scale(.x, center = TRUE, scale = TRUE)), .names = "{.col}_std"))
+  
+## Impressions
+model_time <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = df_time)
+
+inference_time <- coeftest(model_time, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out_time <- broom::tidy(inference_time, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_time, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out_time
+
+```
+
+## Robustness check: Check different time frames (TV truel)
+
+```{r}
+
+# Create daily dataframe
+df_time <- fb_candidates_loc %>%
+  filter(party != "others") %>%
+  filter(state == location_ad) %>%
+  filter(ad_indicator == 1) %>%
+  mutate(ad_delivery_start_time = ymd(ad_delivery_start_time),
+         ad_delivery_stop_time = ymd(ad_delivery_stop_time),
+         ad_delivery_stop_time = ifelse(is.na(ad_delivery_stop_time), ad_delivery_start_time, ad_delivery_stop_time),
+         delivered = map2(ad_delivery_start_time, ad_delivery_stop_time, `:`)) %>%
+  unnest(cols = c(delivered)) %>%
+  mutate(delivered = as_date(delivered)) %>%
+  filter(delivered <= "2021-09-26") %>%
+  group_by(id) %>%
+  mutate(impressions = impressions/n()) 
+
+# Vector of truel dates
+truels <- c("2021-05-20", "2021-08-29", "2021-09-12", "2021-09-19")
+
+  
+# Assign each observation to corresponding period
+df_time <- df_time %>%
+  mutate(df = case_when(
+    delivered >= truels[1] & delivered < truels[2] ~ 1,
+    delivered >= truels[2] & delivered < truels[3] ~ 2,
+    delivered >= truels[3] & delivered < truels[4] ~ 3,
+    delivered >= truels[4] ~ 4
+  ))
+  
+# Create list of data frames for different time intervals  
+df_model_time <- list(
+  df_time %>% filter(df >= 1),
+  df_time %>% filter(df >= 2),
+  df_time %>% filter(df >= 3),
+  df_time %>% filter(df >= 4)
+)  
+  
+# Prepare data
+df_model_time <- df_model_time %>%
+  map(~ .x %>%
+        rename_with(~ str_replace(.x, "\\-|\\+", "_"), .cols = starts_with("share_")) %>%
+        group_by(candidate_id) %>%
+        summarize(across(.cols = c(impressions, audience, spend), ~ sum(.x, na.rm = TRUE)),
+                  across(.cols = starts_with("share_"), ~ mean(.x, na.rm = TRUE))) %>%
+        mutate(time_indicator = 1) %>%
+        right_join(candidates %>% filter(party != "others"), by = "candidate_id") %>%
+        mutate(across(c(impressions, audience, spend), ~ ifelse(is.na(time_indicator), 0, .x)),
+               across(.cols = where(is.numeric), ~ ifelse(is.nan(.x), NA, .x)),
+               across(.cols = c(impressions, audience, spend), ~ as.vector(scale(.x, center = TRUE, scale = TRUE)), .names = "{.col}_std")))
+
+## Impressions
+models_time <- map(df_model_time, ~ lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = .x))
+
+inference_time <- map(models_time, ~ coeftest(.x, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = .x$party))
+
+# Model summary
+out <- map(inference_time, ~ broom::tidy(.x, conf.level = 0.95, conf.int = T, .id = "model") %>%
+             rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+             cbind(broom::tidy(.x, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+             rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high"))
+out
+
+```
+
+## Robustness check: Include "other" candidates
+
+```{r}
+
+# Prepare data
+df_model_others <- fb_candidates_loc %>%
+  filter(state == location_ad) %>%
+  group_by(candidate_id) %>%
+  summarize(across(.cols = c(impressions, audience, spend), ~ sum(.x, na.rm = TRUE)),
+            across(.cols = starts_with("share_"), ~ mean(.x, na.rm = TRUE))) %>%
+  right_join(candidates, by = "candidate_id") %>%
+  mutate(across(c(impressions, audience, spend), ~ ifelse(is.na(.x), 0, .x)),
+         across(.cols = where(is.numeric), ~ ifelse(is.nan(.x), NA, .x)),
+         across(.cols = c(impressions, audience, spend), ~ as.vector(scale(.x, center = TRUE, scale = TRUE)), .names = "{.col}_std")) %>%
+  mutate(performance = vote_share_direct - vote_share_second,
+         constituency = as_factor(constituency))
+
+## Impressions
+model_others <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = df_model_others)
+
+inference_others <- coeftest(model_others, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out <- broom::tidy(inference_others, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_others, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out
+
+```
+
+## Robustness check: Clustered standard error on constituency level
+
+```{r}
+
+# Standard errors on constituency level
+inference_se_constituency <- coeftest(model_choice, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ constituency)
+
+# Model summary
+out <- broom::tidy(inference_se_constituency, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_se_constituency, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out
+
+```
+
+## Robustness check: Remove outliers (windsorize data)
+
+```{r}
+
+# Prepare data
+df_model_outliers <- fb_candidates_loc %>%
+  filter(party != "others") %>%
+  filter(state == location_ad) %>%
+  rename_with(~ str_replace(.x, "\\-|\\+", "_"), .cols = starts_with("share_")) %>%
+  group_by(candidate_id) %>%
+  summarize(across(.cols = c(impressions, audience, spend), ~ sum(.x, na.rm = TRUE)),
+            across(.cols = starts_with("share_"), ~ mean(.x, na.rm = TRUE))) 
+
+# Apply filters
+df_model_outliers_1 <- df_model_outliers %>%
+  filter(impressions >= quantile(impressions, 0.005) & impressions <= quantile(impressions, 0.995))
+df_model_outliers_2 <- df_model_outliers %>%
+  filter(impressions >= quantile(impressions, 0.025) & impressions <= quantile(impressions, 0.975))
+  
+df_model_outliers <- list(df_model_outliers_1, df_model_outliers_2)
+
+df_model_outliers <- df_model_outliers %>%
+  map(~ .x %>% left_join(candidates %>% filter(party != "others"), by = "candidate_id") %>%
+        mutate(across(c(impressions, audience, spend), ~ ifelse(is.na(.x), 0, .x)),
+               across(.cols = where(is.numeric), ~ ifelse(is.nan(.x), NA, .x)),
+               across(.cols = c(impressions, audience, spend), ~ as.vector(scale(.x, center = TRUE, scale = TRUE)), .names = "{.col}_std")) %>%
+        mutate(performance = vote_share_direct - vote_share_second,
+               constituency = as_factor(constituency)))
+
+## Impressions
+model_outliers <- map(df_model_outliers, ~ lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = .x))
+
+inference_outliers <- map(model_outliers, ~ coeftest(.x, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = .x$party))
+
+# Model summary
+out <- map(inference_outliers, ~ broom::tidy(.x, conf.level = 0.95, conf.int = T, .id = "model") %>%
+             rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+             cbind(broom::tidy(.x, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+             rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high"))
+out
+
+```
+
+## Robustness check: Remove outliers (top candidates)
+
+```{r}
+
+top_candidates <- c("olaf scholz", "annalena baerbock", "christian lindner")
+
+# Prepare data
+df_model_outliers <- df_model %>%
+  filter(!(candidate %in% top_candidates)) %>%
+  mutate(across(.cols = c(impressions, audience, spend), ~ as.vector(scale(.x, center = TRUE, scale = TRUE)), .names = "{.col}_std"))
+
+## Impressions
+model_outliers <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = df_model_outliers)
+
+inference_outliers <- coeftest(model_outliers, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out <- broom::tidy(inference_outliers, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_outliers, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out
+
+```
+
+# Robustness check: Ad effect of impressions outside of home state
+
+```{r}
+
+df_model_out <- fb_candidates_loc %>%
+  # Filter ads by other parties
+  filter(party != "others") %>%
+  group_by(candidate_id) %>%
+  summarize(across(.cols = c(impressions, audience, spend), ~ sum(.x, na.rm = TRUE)),
+            across(.cols = starts_with("share_"), ~ mean(.x, na.rm = TRUE))) %>%
+  right_join(candidates %>% filter(party != "others"), by = "candidate_id") %>%
+  mutate(across(c(impressions, audience, spend), ~ ifelse(is.na(.x), 0, .x)),
+         across(.cols = where(is.numeric), ~ ifelse(is.nan(.x), NA, .x)),
+         across(.cols = c(impressions, audience, spend), ~ as.vector(scale(.x, center = TRUE, scale = TRUE)), .names = "{.col}_std")) %>%
+  mutate(performance = vote_share_direct - vote_share_second,
+         constituency = as_factor(constituency))
+
+## Impressions
+model_out <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = df_model_out)
+
+inference_out <- coeftest(model_out, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out <- broom::tidy(inference_out, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_out, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out
+
+```
+
+## Heterogeneity analysis: Main effect by platform
+
+```{r}
+
+n_ads_platform <- fb_candidates %>%
+  filter(party != "others") %>%
+  group_by(candidate_id, platform) %>%
+  summarize(n_ads_by_platform = n(),
+            constituency = factor(first(constituency)),
+            party = first(party)) %>%
+  pivot_wider(id_cols = c(candidate_id, constituency, party), names_from = platform, values_from = n_ads_by_platform) %>%
+  rename(Facebook_Instagram = `Facebook and Instagram`) %>%
+  mutate(FB_only = ifelse(!is.na(Facebook), 1, 0),
+         IG_only = ifelse(!is.na(Instagram), 1, 0),
+         FB_IG = ifelse(!is.na(Facebook_Instagram), 1, 0),
+         across(.cols = c(Facebook, Instagram, Facebook_Instagram), ~ ifelse(is.na(.x), 0, .x)))
+
+df_model_platform <- df_model %>%
+  left_join(n_ads_platform, by = c("candidate_id", "constituency", "party")) %>%
+  mutate(across(.cols = c("Facebook_Instagram", "Facebook", "Instagram", "FB_only", "IG_only", "FB_IG"), ~ ifelse(is.na(.x), 0, .x)))
+
+model_platform_1 <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", "FB_only", gesis_vars_median_imp)),
+   data = df_model_platform)
+
+inference_platform_1 <- coeftest(model_platform_1, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+model_platform_2 <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", "IG_only", gesis_vars_median_imp)),
+   data = df_model_platform)
+
+inference_platform_2 <- coeftest(model_platform_2, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+model_platform_3 <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "party", "constituency", "incumbent", "FB_IG", gesis_vars_median_imp)),
+   data = df_model_platform)
+
+inference_platform_3 <- coeftest(model_platform_3, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+```
+
+# Heterogeneity analysis: East- vs. West-Germany
+
+```{r}
+
+df_model_east <- df_model %>% left_join(structural_data, by = "constituency")
+
+model_east <- lm(make_formula("log_vote_ratio", "impressions_std", c("vote_share_second", "vote_share_direct17", "east", "party", "constituency", "incumbent", gesis_vars_median_imp)),
+   data = df_model_east)
+
+inference_east <- coeftest(model_east, vcov = vcovCL, cadjust = TRUE, type = "HC1", cluster = ~ party)
+
+# Model summary
+out <- broom::tidy(inference_east, conf.level = 0.95, conf.int = T, .id = "model") %>%
+  rename("conf.low.95" = "conf.low", "conf.high.95" = "conf.high") %>%
+  cbind(broom::tidy(inference_east, conf.level = 0.99, conf.int = T, .id = "model")[, c("conf.low", "conf.high")]) %>%
+  rename("conf.low.99" = "conf.low", "conf.high.99" = "conf.high")
+out
+
+```
+
+# Causal sensitivity analysis
+
+# Sensitivity analysis (based on Cinelli & Hazlett 2020)
+
+# Main model
+
+```{r}
+
+# Main model
+sens_impressions <- sensemakr(model = model_choice,
+                              treatment = "impressions_std",
+                              benchmark_covariates = c("incumbent1", "effort_time_spent_median_imp", "effort_team_size_median_imp", "effort_consulting_median_imp1", "effort_budget_median_imp"),
+                              kd = 1:3,
+                              alpha = 0.05)
+summary(sens_impressions)
+
+# Point estimate
+plot(sens_impressions)
+# t-value
+pdf(file = "sensitivity.pdf")
+y<-plot(sens_impressions, sensitivity.of = "t-value")
+dev.off()
+contour(y$r2dz.x, y$r2yz.dx, y$value)
+
+ggplot(data = test) +
+  geom_contour(aes(x = grid_values.x, y = grid_values.y, z = df$z))
+
+  geom_point(aes(x = r2dz.x, y = r2yz.dx))
+
+# Extreme scenario
+plot(sens_impressions, type = "extreme")
+
+```
+
+# Table with results of sensitivity analysis
+
+```{r}
+
+# Variable names for sensitivity analysis
+vars <- c("incumbent1", "effort_time_spent_median_imp", "effort_team_size_median_imp",  "effort_consulting_median_imp1", "effort_budget_median_imp")
+
+# Create table sensitivity analysis
+# Impressions
+tbl_sensitivity_impres <- map_dfr(vars, ~ sensemakr(model = model_choice,
+                                         treatment = "impressions_std",
+                                         benchmark_covariates = c(.x),
+                                         kd = 1:3,
+                                         alpha = 0.05)[["bounds"]]) %>%
+  mutate(adj_pvalue = 2* pt(abs(adjusted_t), model_choice$df.residual, lower.tail = FALSE)) %>% 
+  select(bound_label, adjusted_estimate, adjusted_se, adjusted_t, adj_pvalue, ends_with("CI")) %>%
+  rename("adjusted_lower_CI_95" = "adjusted_lower_CI", "adjusted_upper_CI_95" = "adjusted_upper_CI") %>%
+  cbind(map_dfr(vars, ~ sensemakr(model = model_choice,
+                                  treatment = "impressions_std",
+                                  benchmark_covariates = c(.x),
+                                  kd = 1:3,
+                                  alpha = 0.01)[["bounds"]]) %>%
+          select(ends_with("CI"))) %>%
+  rename("adjusted_lower_CI_99" = "adjusted_lower_CI", "adjusted_upper_CI_99" = "adjusted_upper_CI") %>%
+  mutate(strength = parse_number(bound_label),
+         term = factor(case_when(
+           str_detect(bound_label, "incumbent") == TRUE ~ "Incumbent",
+           str_detect(bound_label, "time") == TRUE ~ "Time investment (h/week)", 
+           str_detect(bound_label, "team") == TRUE ~ "Team size", 
+           str_detect(bound_label, "consulting") == TRUE ~ "Consulting (= 1 if yes)", 
+           str_detect(bound_label, "budget") ~ "Budget (in EUR)"
+         ), levels = c("Incumbent", "Time investment (h/week)", "Team size", "Consulting (= 1 if yes)", "Budget (in EUR)")),
+         strength = factor(str_c(parse_number(bound_label), " x control")))
+
+# Spending
+tbl_sensitivity_spend <- map_dfr(vars, ~ sensemakr(model = model_spending,
+                                         treatment = "spend_std",
+                                         benchmark_covariates = c(.x),
+                                         kd = 1:3,
+                                         alpha = 0.05)[["bounds"]]) %>%
+  mutate(adj_pvalue = 2* pt(abs(adjusted_t), model_choice$df.residual, lower.tail = FALSE)) %>% 
+  select(bound_label, adjusted_estimate, adjusted_se, adjusted_t, adj_pvalue, ends_with("CI")) %>%
+  rename("adjusted_lower_CI_95" = "adjusted_lower_CI", "adjusted_upper_CI_95" = "adjusted_upper_CI") %>%
+  cbind(map_dfr(vars, ~ sensemakr(model = model_spending,
+                                  treatment = "spend_std",
+                                  benchmark_covariates = c(.x),
+                                  kd = 1:3,
+                                  alpha = 0.01)[["bounds"]]) %>%
+          select(ends_with("CI"))) %>%
+  rename("adjusted_lower_CI_99" = "adjusted_lower_CI", "adjusted_upper_CI_99" = "adjusted_upper_CI") %>%
+  mutate(strength = parse_number(bound_label),
+         term = factor(case_when(
+           str_detect(bound_label, "incumbent") == TRUE ~ "Incumbent",
+           str_detect(bound_label, "time") == TRUE ~ "Time investment (h/week)", 
+           str_detect(bound_label, "team") == TRUE ~ "Team size", 
+           str_detect(bound_label, "consulting") == TRUE ~ "Consulting (= 1 if yes)", 
+           str_detect(bound_label, "budget") ~ "Budget (in EUR)"
+         ), levels = c("Incumbent", "Time investment (h/week)", "Team size", "Consulting (= 1 if yes)", "Budget (in EUR)")),
+         strength = factor(str_c(parse_number(bound_label), " x control")))
+
+# Number of ads
+tbl_sensitivity_n_ads <- map_dfr(vars, ~ sensemakr(model = model_ads,
+                                         treatment = "n_ads_std",
+                                         benchmark_covariates = c(.x),
+                                         kd = 1:3,
+                                         alpha = 0.05)[["bounds"]]) %>%
+  mutate(adj_pvalue = 2* pt(abs(adjusted_t), model_choice$df.residual, lower.tail = FALSE)) %>% 
+  select(bound_label, adjusted_estimate, adjusted_se, adjusted_t, adj_pvalue, ends_with("CI")) %>%
+  rename("adjusted_lower_CI_95" = "adjusted_lower_CI", "adjusted_upper_CI_95" = "adjusted_upper_CI") %>%
+  cbind(map_dfr(vars, ~ sensemakr(model = model_ads,
+                                  treatment = "n_ads_std",
+                                  benchmark_covariates = c(.x),
+                                  kd = 1:3,
+                                  alpha = 0.01)[["bounds"]]) %>%
+          select(ends_with("CI"))) %>%
+  rename("adjusted_lower_CI_99" = "adjusted_lower_CI", "adjusted_upper_CI_99" = "adjusted_upper_CI") %>%
+  mutate(strength = parse_number(bound_label),
+         term = factor(case_when(
+           str_detect(bound_label, "incumbent") == TRUE ~ "Incumbent",
+           str_detect(bound_label, "time") == TRUE ~ "Time investment (h/week)", 
+           str_detect(bound_label, "team") == TRUE ~ "Team size", 
+           str_detect(bound_label, "consulting") == TRUE ~ "Consulting (= 1 if yes)", 
+           str_detect(bound_label, "budget") ~ "Budget (in EUR)"
+         ), levels = c("Incumbent", "Time investment (h/week)", "Team size", "Consulting (= 1 if yes)", "Budget (in EUR)")),
+         strength = factor(str_c(parse_number(bound_label), " x control")))
+
+```
+
+# Visualization: Sensititivity analaysis
+
+```{r}
+
+# Plot coefficients: Impressions
+coeff_plot <- ggplot(data = tbl_sensitivity_impres, mapping = aes(x = term, y = adjusted_estimate, fill = strength, color = strength, ymin = adjusted_lower_CI_95, ymax = adjusted_upper_CI_95)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  geom_pointrange(position = position_dodge(width = 0.75), linewidth = 1.5, size = 1, shape = 21) +
+  geom_pointrange(aes(x = term, y = adjusted_estimate, fill = strength, color = strength, ymin = adjusted_lower_CI_99, ymax = adjusted_upper_CI_99),
+                  position = position_dodge(width = 0.75), linewidth = 1, shape = 21) +
+  scale_y_continuous(
+    limits = c(-0.005, 0.04) ,
+    breaks = seq(-0.02, 0.06, 0.01),
+    labels = c("-0.02", "", "0", "", "0.02", "", "0.04", "", "0.06")
+  ) +
+  scale_fill_manual(values = c("#008080", "#FF7F50", "#708090")) +
+  scale_color_manual(values = c("#008080", "#FF7F50", "#708090")) +
+  theme(legend.position = "right",
+        legend.direction = "vertical",
+        plot.margin = grid::unit(c(2, 3, 1, 2), "mm"),
+        panel.grid.minor = element_blank(),
+        text = element_text(size = 18),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  xlab("") +
+  ylab("adj. Coefficient")
+
+coeff_plot
+ggsave(coeff_plot, filename = str_c(path_figures, "sensitivity_coeff_plot.pdf"), width = 17, height = 13, units = "cm")
+
+# Plot coefficients: Spending
+coeff_plot <- ggplot(data = tbl_sensitivity_spend, mapping = aes(x = term, y = adjusted_estimate, fill = strength, color = strength, ymin = adjusted_lower_CI_95, ymax = adjusted_upper_CI_95)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  geom_pointrange(position = position_dodge(width = 0.75), linewidth = 1.5, size = 1, shape = 21) +
+  geom_pointrange(aes(x = term, y = adjusted_estimate, fill = strength, color = strength, ymin = adjusted_lower_CI_99, ymax = adjusted_upper_CI_99),
+                  position = position_dodge(width = 0.75), linewidth = 1, shape = 21) +
+  scale_y_continuous(
+    limits = c(-0.005, 0.04) ,
+    breaks = seq(-0.02, 0.06, 0.01),
+    labels = c("-0.02", "", "0", "", "0.02", "", "0.04", "", "0.06")
+  ) +
+  scale_fill_manual(values = c("#008080", "#FF7F50", "#708090")) +
+  scale_color_manual(values = c("#008080", "#FF7F50", "#708090")) +
+  theme(legend.position = "right",
+        legend.direction = "vertical",
+        plot.margin = grid::unit(c(2, 3, 1, 2), "mm"),
+        panel.grid.minor = element_blank(),
+        text = element_text(size = 18),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  xlab("") +
+  ylab("adj. Coefficient")
+
+coeff_plot
+ggsave(coeff_plot, filename = str_c(path_figures, "sensitivity_coeff_plot_spend.pdf"), width = 17, height = 13, units = "cm")
+
+# Plot coefficients: Number of ads
+coeff_plot <- ggplot(data = tbl_sensitivity_n_ads, mapping = aes(x = term, y = adjusted_estimate, fill = strength, color = strength, ymin = adjusted_lower_CI_95, ymax = adjusted_upper_CI_95)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  geom_pointrange(position = position_dodge(width = 0.75), linewidth = 1.5, size = 1, shape = 21) +
+  geom_pointrange(aes(x = term, y = adjusted_estimate, fill = strength, color = strength, ymin = adjusted_lower_CI_99, ymax = adjusted_upper_CI_99),
+                  position = position_dodge(width = 0.75), linewidth = 1, shape = 21) +
+  scale_y_continuous(
+    limits = c(-0.005, 0.04) ,
+    breaks = seq(-0.02, 0.06, 0.01),
+    labels = c("-0.02", "", "0", "", "0.02", "", "0.04", "", "0.06")
+  ) +
+  scale_fill_manual(values = c("#008080", "#FF7F50", "#708090")) +
+  scale_color_manual(values = c("#008080", "#FF7F50", "#708090")) +
+  theme(legend.position = "right",
+        legend.direction = "vertical",
+        plot.margin = grid::unit(c(2, 3, 1, 2), "mm"),
+        panel.grid.minor = element_blank(),
+        text = element_text(size = 18),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  xlab("") +
+  ylab("adj. Coefficient")
+
+coeff_plot
+ggsave(coeff_plot, filename = str_c(path_figures, "sensitivity_coeff_plot_n_ads.pdf"), width = 17, height = 13, units = "cm")
+```
+

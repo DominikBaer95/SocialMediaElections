@@ -1,0 +1,655 @@
+---
+title: "descriptives_ad_effects"
+author: "Dominik Bär"
+date: "2023-01-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# File description
+
+```{r}
+
+# This file provides descriptive statistics on Meta ad data and election results
+
+```
+
+# Set up environment
+
+```{r, include=FALSE, echo=FALSE}
+
+# Clean environment
+rm(list = ls())
+
+# Load packages
+library(tidyverse)
+library(lubridate)
+library(moments)
+library(viridis)
+library(ggeffects)
+library(sf)
+library(ggrepel)
+library(ggpubr)
+library(ggh4x)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+library(xtable)
+
+source("utils.R")
+
+# Set seed
+set.seed(42)
+
+# Define paths to data
+path_data <- "../data/"
+path_figures <- "../doc/Nat Comms/figures/"
+
+# Party names
+parties <- c("cdu", "csu", "spd", "afd", "fdp", "linke", "gruene")
+# Party colors
+parties_colors <- c("#e3000f", "#000000", "#46962b", "#ffed00", "#009ee0", "#b61c3e")
+# Federal states germany
+states <- c("Bayern", "Baden-Württemberg", "Thüringen", "Hessen", "Saarland", "Rheinland-Pfalz", "Nordrhein-Westfalen", "Niedersachsen", "Sachsen-Anhalt", "Sachsen", "Brandenburg", "Mecklenburg-Vorpommern", "Schleswig-Holstein", "Berlin", "Hamburg", "Bremen")
+
+```
+
+# Load data
+
+```{r}
+
+# Load candidate data
+candidates <- read_csv(str_c(path_data, "misc/btw21_candidates_processed.csv"))
+
+# Load ad data/model data frame
+df_model <- read_csv(file = str_c(path_data, "df_model.csv"))
+
+# Load map data
+geom_constituency <- read_sf(dsn = str_c(path_data, "misc/btw21_geometrie_wahlkreise/Geometrie_Wahlkreise_20DBT_VG250_geo.shp")) %>%
+  mutate(constituency = factor(WKR_NR))
+
+# Load raw facebook data
+fb_candidates <- read_csv(str_c(path_data, "fb_ad_library/processed/", "fb_candidates.csv"))
+fb_candidates_loc <- read_csv(str_c(path_data, "fb_ad_library/processed/", "fb_candidates_loc.csv")) # by location
+
+# Load election results
+election_results <- read_csv(str_c(path_data, "misc/election_results_processed.csv"))
+
+```
+
+# Graph theme setup
+
+```{r}
+
+theme_set(
+  theme_bw() +
+    theme(legend.position = c(0.7, 0.9),
+          legend.title = element_blank(), 
+          legend.direction = "horizontal",
+          legend.text = element_text(colour="black", size=12), 
+          legend.background=element_rect(fill="transparent", colour=NA),
+          legend.key = element_rect(fill = "transparent", colour = "transparent"),
+          legend.key.width = unit(0.5, "cm"), 
+          legend.key.height = unit(0.5, "cm")
+    ) + 
+    theme(axis.text.x=element_text(colour = "black", size=12, vjust=0.5), 
+          axis.text.y=element_text(colour = "black", size=12, vjust=0.5),
+          axis.title.x=element_text(size=12), 
+          axis.title.y=element_text(size=12, vjust=1.5)
+    )
+)
+
+```
+
+# Statistics
+
+```{r}
+
+# Number of candidates 
+df_model %>% distinct(candidate) %>% nrow()
+
+# Candidates by party
+df_model %>% group_by(party) %>% summarize(n())
+
+# Number of ads
+df_model %>% summarize(sum(n_ads))
+
+# Ads by party
+df_model %>% group_by(party) %>% summarize(sum(n_ads))
+
+# Avg. price of ad
+sum(df_model$spend)/sum(df_model$n_ads)
+
+# Avg. number of impressions
+sum(df_model$impressions)/sum(df_model$n_ads)
+
+# Avg. price impression
+sum(df_model$spend)/sum(df_model$impressions)
+
+# Distribution of vote shares
+ggplot(df_model) + geom_density(aes(x = vote_share_direct))
+
+# Table of summary statistics
+stats_summary <- df_model %>%
+  select(-ends_with("median_imp"), -ends_with("mean_imp")) %>%
+  select(vote_share_direct, log_vote_ratio, abstentions, vote_share_second, vote_share_second, performance, # Election variables,
+         n_ads, impressions, spend, share_female, matches("share_\\d"), sentiment, # Facebook variables
+         incumbent, age, female, election_list, starts_with("effort_"), news_volume_gesis) %>% # Candidate variables
+  rename_with(~ str_remove_all(.x, pattern = "_"), .cols = everything()) %>%
+  summarize(across(.cols = everything(), .fns = list(mean = mean, sd = sd, min = min, max = max, skew = skewness), na.rm = TRUE)) %>%
+  pivot_longer(cols = everything(),
+               names_to = c(".value", "set"),
+               names_sep = "_") %>%
+  mutate(across(.cols = -set, ~ round(.x, digits = 3))) %>%
+  as.matrix() %>%
+  t()
+
+#print.xtable(xtable(stats_summary), booktabs = TRUE, include.rownames = TRUE, include.colnames = FALSE, format.args=list(big.mark = ",", decimal.mark = "."))
+
+```
+
+# Distribution by meta ranges for spending and impressions
+
+```{r}
+
+# Spending
+dist_spending <- fb_candidates %>%
+  filter(party != "others") %>%
+  select(id, spend_ub, spend_lb) %>%
+  mutate(spend_ub = ifelse(spend_ub < 99, 99, spend_ub),
+         range_spend = str_c(as.character(spend_lb), " - ", as.character(spend_ub))) %>%
+  group_by(range_spend) %>%
+  summarize(n_range = n(),
+            share_range = n()/21541,
+            spend_lb = first(spend_lb),
+            spend_ub = first(spend_ub)) %>%
+  mutate(share_range = str_c(as.character(round(share_range, digits = 4) * 100), "\\,\\%")) %>%
+  arrange(spend_lb) %>%
+  select(range_spend, n_range)
+  
+#print.xtable(xtable(dist_spending), booktabs = TRUE, include.rownames = FALSE, format.args=list(big.mark = ",", decimal.mark = "."))
+
+# => sort impressions in correct range for ads published after election date
+# Impressions
+dist_impressions <- fb_candidates %>%
+  filter(party != "others") %>%
+  select(id, impressions_lb, impressions_ub) %>%
+  mutate(range_impressions = str_c(as.character(impressions_lb), " - ", as.character(impressions_ub))) %>%
+  group_by(range_impressions) %>%
+  summarize(n_range = n(),
+            share_range = n()/21541,
+            impressions_lb = first(impressions_lb),
+            impressions_ub = first(impressions_ub)) %>%
+  arrange(impressions_lb) %>%
+  select(range_impressions, n_range)
+
+#print.xtable(xtable(dist_impressions), booktabs = TRUE, include.rownames = FALSE, format.args=list(big.mark = ",", decimal.mark = "."))
+
+```
+
+# Descriptives
+## Vote share
+
+```{r}
+
+## Vote share: Map by constituency and party
+# Define city locations
+cities <- tibble(
+  city = c("Berlin", "Hamburg", "Munich"),
+  Lat = c(52.520008, 53.551086, 48.137154),
+  Long = c(13.404954, 9.993682, 11.576124)) %>%
+  st_as_sf(coords = c("Lat", "Long"), remove = FALSE) %>%
+  st_sf()
+
+df_plot <- election_results %>%
+  filter(party != "others") %>%
+  left_join(geom_constituency, by = c("constituency" = "WKR_NR")) %>%
+  mutate(party = factor(party, levels = c("spd", "union", "gruene", "fdp", "afd", "linke"), labels = c("SPD", "Union", "Grüne", "FDP", "AFD", "Die Linke"))) %>%
+  group_by(party) %>%
+  group_split()
+
+plot_map <- map(df_plot, ~ ggplot(.x) +
+  geom_sf(aes(geometry = geometry, fill = vote_share_direct), size = 0.001, color = "white") +
+  geom_point(data = cities, aes(x = Long, y = Lat), size = 0.5) +
+  geom_text_repel(data = cities, aes(x = Long, y = Lat, label = city),
+                  size = 0.36 * 12,
+                  point.size = 0.1) +
+  scale_fill_viridis_c(
+    option = "viridis",
+    direction = -1,
+    breaks = seq(0, 0.5, 0.1),
+    labels = c("", "10 %", "", "30 %", "", "50 %"),
+    limits = c(0, 0.55)
+  ) +
+  theme(legend.position = "none",
+        legend.direction = "horizontal",
+        legend.key.width = unit(1, "cm"),
+        panel.grid = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank()) +
+  xlab("") +
+  ylab("") +
+  force_panelsizes(rows = unit(13.5, "cm"),
+                   cols = unit(10, "cm")))
+
+plot_map
+map2(plot_map, df_plot, ~ ggsave(str_c(path_figures, "vote_share_", .y$party[1], ".pdf"), plot = .x, width = 15, height = 17, units = "cm"))
+
+# Legend 
+plot_map <- ggplot(data = df_plot[[1]]) +
+  geom_sf(aes(geometry = geometry, fill = vote_share_direct)) +
+  theme(
+    legend.position = "right",
+    legend.direction = "horizontal",
+    legend.text = element_text(size = 18),
+    legend.key.width = unit(6, "cm"),
+  ) +
+  scale_fill_viridis_c(
+    option = "viridis",
+    direction = -1,
+    breaks = seq(0, 0.5, 0.1),
+    labels = c("", "10 %", "20 %", "30 %", "40 %", "50 %"),
+    limits = c(0, 0.55)) +
+  labs(fill = "Vote share")
+
+map_legend <- as_ggplot(get_legend(plot_map))
+
+ggsave(map_legend, filename = str_c(path_figures, "vote_share_map_legend.pdf"), width = 40, height = 2, units = "cm")
+
+## Vote share: Advertising on FB vs. no advertisement
+# Create indicator for candidates advertising on FB/IG
+candidates_fb <- fb_candidates %>% 
+  filter(party != "others") %>% 
+  distinct(candidate, .keep_all = TRUE) %>% 
+  select(party, constituency, candidate) %>%
+  mutate(ad_indicator = 1)
+  
+# Join candidates with and without ads
+candidates <- candidates %>%
+  filter(direct_election == 1) %>%
+  mutate(party = ifelse(party %in% c("cdu", "csu"), "union", party),
+         party = str_remove(party, pattern = "die "),
+         party = str_replace(party, pattern = "grüne", "gruene"),
+         party = ifelse(!str_detect(party, "union|spd|afd|fdp|linke|gruene"), "others", party)) %>%
+  filter(party != "others") %>%
+  left_join(candidates_fb, by = c("constituency", "party")) %>%
+  mutate(ad_indicator = factor(ifelse(is.na(ad_indicator), 0, ad_indicator), levels = c(0, 1), labels = c("No ads", "Ads")),
+         female = factor(female, levels = c(0, 1), labels = c("Male", "Female"))) %>%
+  left_join(election_results, by = c("party", "constituency"))
+
+# Test distributional difference
+test <- candidates %>% select(ad_indicator, vote_share_direct) %>% group_by(ad_indicator) %>% group_split(.keep = F)
+wilcox.test(test[[1]][["vote_share_direct"]], test[[2]][["vote_share_direct"]], alternative = "two.sided")
+
+medians <- as_vector(map(test, ~ median(.x$vote_share_direct)))
+
+plot_box <- ggplot(candidates, aes(x = ad_indicator, y = vote_share_direct)) +
+  stat_boxplot(geom = "errorbar", width = 0.2, color = "black", size = 1) +
+  geom_boxplot(color = "black", size = 1, width = 0.5, outlier.shape = NA) +
+  geom_violin(aes(fill = ad_indicator), alpha = 0.3, color = NA) +
+  geom_jitter(aes(color = ad_indicator), alpha = 0.3, size = 1, width = 0.2) +
+  stat_summary(fun=mean, geom="point", shape=20, size=5, color = "red", alpha = 0.5) +
+  geom_label(label = str_c("Obs. = ", "1,019"), x = "No ads", y = 0.6) +
+  geom_label(label = str_c("Obs. = ", "766"), x = "Ads", y = 0.6) +
+  scale_fill_manual(values = c("#7A9DCF", "#B2DF8A")) +
+  scale_color_manual(name = NULL, values = c("#7A9DCF", "#B2DF8A"), guide = "none") +
+  scale_y_continuous(breaks = seq(0, 0.7, 0.1),
+                     labels = c(0, "", "20 %", "", "40 %", "", "60 %", ""),
+                     limits = c(0, 0.62)) +
+  theme(legend.position = "right",
+        legend.direction = "vertical",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        axis.text.x = element_blank()
+        ) +
+  xlab("") +
+  ylab("Vote share") +
+  geom_text(aes(x = 2.47, y = mean(medians), label = "***")) +
+  annotate("segment", x = 2.4, y = medians[1], yend = medians[2], xend = 2.4,
+           size = 1, arrow = arrow(ends = "both", type = "closed", angle = 90, length = unit(0.2,"cm")))
+
+plot_box
+ggsave(str_c(path_figures, "vote_share_dist_box.pdf"), width = 15, height = 10, units = "cm")
+
+```
+
+## Impressions, Spending, Number of Ads
+
+```{r}
+
+## Impressions & Spending: Distribution by party
+df_plot <- fb_candidates_loc %>%
+  filter(party != "others") %>%
+  filter(state == location_ad) %>%
+  group_by(party) %>%
+  summarize(n_ads = n(),
+            impressions = sum(impressions, na.rm = TRUE),
+            spend = sum(spend, na.rm = TRUE)) %>%
+  mutate(party = factor(party, levels = c("spd", "union", "gruene", "fdp", "afd", "linke"), labels = c("SPD", "Union", "Grüne", "FDP", "AFD", "Die Linke")))
+  
+# Plot number of impressions
+plot_bar <- ggplot(df_plot, aes(x = party, y = impressions, color = party, fill = party)) +
+  geom_bar(stat = "identity", position = "dodge2") +
+  scale_color_manual(values = parties_colors) +
+  scale_fill_manual(values = parties_colors) +
+  scale_y_continuous(
+    breaks = seq(0, 60000000, 10000000),
+    labels = c("0", "", "20", "", "40", "", "60")
+  ) +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  guides(colour = guide_legend(nrow = 1)) +
+  xlab("") +
+  ylab("Impressions (in millions)")
+
+plot_bar
+ggsave(str_c(path_figures, "n_impres_dist_party.pdf"), width = 18, height = 12, units = "cm")
+
+# Plot spending
+plot_bar <- ggplot(df_plot, aes(x = party, y = spend, color = party, fill = party)) +
+  geom_bar(stat = "identity", position = "dodge2") +
+  scale_color_manual(values = parties_colors) +
+  scale_fill_manual(values = parties_colors) +
+  scale_y_continuous(
+    breaks = seq(0, 600000, 100000),
+    labels = c("0", "", "200,000", "", "400,000", "", "600,000")
+  ) +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  guides(colour = guide_legend(nrow = 1)) +
+  xlab("") +
+  ylab("Spending (in EUR)")
+
+plot_bar
+ggsave(str_c(path_figures, "spend_dist_party.pdf"), width = 18, height = 12, units = "cm")
+
+# Plot number of ads
+plot_bar <- ggplot(df_plot, aes(x = party, y = n_ads, color = party, fill = party)) +
+  geom_bar(stat = "identity", position = "dodge2") +
+  scale_color_manual(values = parties_colors) +
+  scale_fill_manual(values = parties_colors) +
+  scale_y_continuous(
+    breaks = seq(0, 10000, 2000),
+    labels = c("0", "2,000", "4,000", "6,000", "8,000", "")
+  ) +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  guides(colour = guide_legend(nrow = 1)) +
+  xlab("") +
+  ylab("Number of ads")
+
+plot_bar
+ggsave(str_c(path_figures, "n_ads_dist_party.pdf"), width = 18, height = 12, units = "cm")
+
+# Legend parties
+plot_bar <- ggplot(df_plot, aes(x = party, y = spend, color = party, fill = party)) +
+  geom_bar(stat = "identity", position = "dodge2") +
+  scale_color_manual(values = parties_colors) +
+  scale_fill_manual(values = parties_colors) +
+  theme(legend.position = "bottom",
+        plot.margin = unit(c(0,0,0,0), "cm")) +
+  guides(colour = guide_legend(nrow = 1))
+  
+bar_legend <- as_ggplot(get_legend(plot_bar))
+
+ggsave(bar_legend, filename = str_c(path_figures, "bar_legend.pdf"), width = 12, height = 0.5, units = "cm")
+
+## Impressions & Spending: Distribution by platform
+# Prepare data
+df_plot <- fb_candidates_loc %>%
+  filter(ad_indicator == 1) %>%
+  filter(party != "others") %>%
+  filter(state == location_ad) %>%
+  #group_by(platform, party) %>%
+  group_by(platform) %>%
+  summarize(n_ads = n(),
+            impressions = sum(impressions, na.rm = TRUE),
+            spend = sum(spend, na.rm = TRUE)) %>%
+  mutate(#party = factor(party, levels = c("spd", "union", "gruene", "fdp", "afd", "linke"), labels = c("SPD", "Union", "Grüne", "FDP", "AFD", "Die Linke")),
+         platform = factor(platform, levels = c("Facebook", "Instagram", "Facebook and Instagram"), labels = c("Facebook-only", "Instagram-only", "Dual platform")))
+
+# Plot number of impressions
+plot_bar <- ggplot(df_plot, aes(x = platform, y = impressions, color = platform, fill = platform)) +
+  geom_bar(stat = "identity", position = "dodge2") +
+  #scale_color_manual(values = parties_colors) +
+  #scale_fill_manual(values = parties_colors) +
+  scale_color_manual(values = c("#3b5998", "#8a3ab9", "#006837")) +
+  scale_fill_manual(values = c("#3b5998", "#8a3ab9", "#006837")) +
+  scale_y_continuous(
+    breaks = seq(0, 90000000, 10000000),
+    labels = c("0", "", "20", "", "40", "", "60", "", "80", "")
+  ) +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  guides(colour = guide_legend(nrow = 1)) +
+  xlab("") +
+  ylab("Impressions (in millions)")
+
+plot_bar
+ggsave(str_c(path_figures, "n_impres_dist_platform.pdf"), width = 18, height = 12, units = "cm")
+
+# Plot spending
+plot_bar <- ggplot(df_plot, aes(x = platform, y = spend, color = platform, fill = platform)) +
+  geom_bar(stat = "identity", position = "dodge2") +
+  scale_color_manual(values = c("#3b5998", "#8a3ab9", "#006837")) +
+  scale_fill_manual(values = c("#3b5998", "#8a3ab9", "#006837")) +
+  scale_y_continuous(
+    breaks = seq(0, 900000, 100000),
+    labels = c("0", "", "200,000", "", "400,000", "", "600,000", "", "800,000", "")
+  ) +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  guides(color = guide_legend(nrow = 1)) +
+  xlab("") +
+  ylab("Spending (in EUR)")
+
+plot_bar
+ggsave(str_c(path_figures, "spend_dist_platform_party.pdf"), width = 18, height = 12, units = "cm")
+
+# Plot number of ads
+plot_bar <- ggplot(df_plot, aes(x = platform, y = n_ads, color = platform, fill = platform)) +
+  geom_bar(stat = "identity", position = "dodge2") +
+  scale_color_manual(values = c("#3b5998", "#8a3ab9", "#006837")) +
+  scale_fill_manual(values = c("#3b5998", "#8a3ab9", "#006837")) +
+  scale_y_continuous(
+    breaks = seq(0, 11000, 1000),
+    labels = c("0", "", "2,000", "", "4,000", "", "6,000", "", "8,000", "", "10,000", "")
+  ) +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  guides(color = guide_legend(nrow = 1)) +
+  xlab("") +
+  ylab("Number of ads")
+
+plot_bar
+ggsave(str_c(path_figures, "n_ads_dist_platform_party.pdf"), width = 18, height = 12, units = "cm")
+
+## Impressions & Spending: Map by constituency
+# Prepare data
+df_plot <- df_model %>%
+  mutate(constituency = factor(constituency)) %>%
+  group_by(constituency) %>%
+  summarize(n_ads = sum(n_ads),
+            impressions = sum(impressions),
+            spend = sum(spend)) %>%
+  right_join(geom_constituency, by = c("constituency"))
+
+# Plot number of impressions
+plot_map <- ggplot(df_plot) +
+  geom_sf(aes(geometry = geometry, fill = impressions), size = 0.001, color = "white") +
+  geom_point(data = cities, aes(x = Long, y = Lat)) +
+  geom_text_repel(data = cities, aes(x = Long, y = Lat, label = city),
+                  size = 0.36 * 12,
+                  nudge_x = c(2, -3, 2.5), nudge_y = c(0.35, 0.9, -0.3)) +
+  scale_fill_viridis_c(
+    direction = -1,
+    breaks = seq(0, 5000000, 1000000),
+    labels = c("", "1", "2", "3", "4", "")
+  ) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.grid = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        plot.tag.position = c(0.55 , 0)) +
+  guides(fill = guide_colorbar(order = 1, barwidth = unit(7, "cm"), barheight = unit(1, "cm")), color = guide_legend(order = 2, label.position = "bottom", keywidth = unit(1.5, "cm"), keyheight = unit(1, "cm"))) +
+  xlab("") +
+  ylab("") +
+  labs(tag = "Impresions (in millions)") +
+  force_panelsizes(rows = unit(13.5, "cm"),
+                   cols = unit(10, "cm"))
+
+plot_map
+ggsave(str_c(path_figures, "n_impres_map_constituency.pdf"), width = 15, height = 17, units = "cm")
+
+# Plot spending
+plot_map <- ggplot(df_plot) +
+  geom_sf(aes(geometry = geometry, fill = spend), size = 0.001, color = "white") +
+  geom_point(data = cities, aes(x = Long, y = Lat)) +
+  geom_text_repel(data = cities, aes(x = Long, y = Lat, label = city),
+                  size = 0.36 * 12,
+                  nudge_x = c(2, -3, 2.5), nudge_y = c(0.35, 0.9, -0.3)) +
+  scale_fill_viridis_c(
+    direction = -1,
+    breaks = seq(0, 50000, 10000),
+    labels = c("", "10,000", "20,000", "30,000", "40,000", "50,000")
+  ) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.grid = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        plot.tag.position = c(0.55 , 0)) +
+  guides(fill = guide_colorbar(order = 1, barwidth = unit(7, "cm"), barheight = unit(1, "cm")), color = guide_legend(order = 2, label.position = "bottom", keywidth = unit(1.5, "cm"), keyheight = unit(1, "cm"))) +
+  xlab("") +
+  ylab("") +
+  labs(tag = "Spending (in EUR)") +
+  force_panelsizes(rows = unit(13.5, "cm"),
+                   cols = unit(10, "cm"))
+
+plot_map
+ggsave(str_c(path_figures, "spend_map_constituency.pdf"), width = 15, height = 17, units = "cm")
+
+# Plot number of ads
+plot_map <- ggplot(df_plot) +
+  geom_sf(aes(geometry = geometry, fill = n_ads), size = 0.001, color = "white") +
+  geom_point(data = cities, aes(x = Long, y = Lat)) +
+  geom_text_repel(data = cities, aes(x = Long, y = Lat, label = city),
+                  size = 0.36 * 12,
+                  nudge_x = c(2, -3, 2.5), nudge_y = c(0.35, 0.9, -0.3)) +
+  scale_fill_viridis_c(
+    direction = -1,
+    breaks = seq(0, 1000, 200),
+    labels = c("", "200", "400", "600", "", "")
+  ) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.grid = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        plot.tag.position = c(0.55 , 0)) +
+  guides(fill = guide_colorbar(order = 1, barwidth = unit(7, "cm"), barheight = unit(1, "cm")), color = guide_legend(order = 2, label.position = "bottom", keywidth = unit(1.5, "cm"), keyheight = unit(1, "cm"))) +
+  xlab("") +
+  ylab("") +
+  labs(tag = "Number of ads") +
+  force_panelsizes(rows = unit(13.5, "cm"),
+                   cols = unit(10, "cm"))
+
+plot_map
+ggsave(str_c(path_figures, "n_ads_map_constituency.pdf"), width = 15, height = 17, units = "cm")
+
+```
+
+## Candidate vars
+
+```{r}
+
+## Discrete candidate vars
+## Gender
+# Prepare data
+df_plot <- candidates %>%
+  select(ad_indicator, female) %>%
+  group_by(ad_indicator) %>%
+  summarize(share_female = sum(female == "Female")/n(),
+            share_male = 1 - share_female,) %>%
+  pivot_longer(cols = c(share_female, share_male), names_to = "female")
+
+groups_size <- candidates %>% group_by(ad_indicator, female) %>% mutate(female = ifelse(female == "Female", "share_female", "share_male")) %>% summarize(size = n())
+
+# Plot data
+plot_bar <- ggplot(df_plot, aes(x = female, y = value, fill = ad_indicator)) +
+  geom_bar(stat = "identity", position = "dodge2") +
+  geom_text(aes(x = female, label = str_c(as.character(round(value * 100, digits = 2)), " %")),
+            position = position_dodge(width=0.9),
+            vjust = -0.5,
+            size = 0.36 * 10,
+            fontface = "italic") +
+  geom_text(aes(x = female, y = 0.03, label = str_c("Obs. = ", groups_size$size)),
+            position = position_dodge(width=0.9),
+            vjust = "center",
+            size = 0.36 * 10,
+            fontface = "italic") +
+  scale_fill_manual(values = c("#7A9DCF", "#B2DF8A")) +
+  scale_x_discrete(labels = c("Female", "Male")) +
+  scale_y_continuous(breaks = seq(0, 0.8, 0.1),
+                     labels = c(0, "", "20 %", "", "40 %", "", "60 %", "", ""),
+                     limits = c(0, 0.75)) +
+  theme(legend.position = "right",
+        legend.direction = "vertical",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  xlab("") +
+  ylab("")
+
+plot_bar
+ggsave(str_c(path_figures, "gender_dist_bar.pdf"), width = 15, height = 10, units = "cm")
+
+## Incumbent
+# Prepare data
+df_plot <- candidates %>%
+  select(ad_indicator, incumbent) %>%
+  group_by(ad_indicator) %>%
+  summarize(share_incumbent = mean(incumbent, na.rm = TRUE),
+            share_no_incumbent = 1 - share_incumbent) %>%
+  pivot_longer(cols = c(share_incumbent, share_no_incumbent), names_to = "incumbent")
+
+groups_size <- candidates %>% group_by(ad_indicator, incumbent) %>% mutate(incumbent = ifelse(incumbent == 1, "share_incumben", "share_no_incumbent")) %>% summarize(size = n())
+
+# Plot data
+plot_bar <- ggplot(df_plot, aes(x = incumbent, y = value, fill = ad_indicator)) +
+  geom_bar(stat = "identity", position = "dodge2") +
+  geom_text(aes(x = incumbent, label = str_c(as.character(round(value * 100, digits = 2)), " %")),
+            position = position_dodge(width=0.9),
+            vjust = -0.5,
+            size = 0.36 * 10,
+            fontface = "italic") +
+  geom_text(aes(x = incumbent, y = 0.03, label = str_c("Obs. = ", groups_size$size)),
+            position = position_dodge(width=0.9),
+            vjust = "center",
+            size = 0.36 * 10,
+            fontface = "italic") +
+  scale_fill_manual(values = c("#7A9DCF", "#B2DF8A")) +
+  scale_x_discrete(labels = c("Incumbent", "No incumbent")) +
+  scale_y_continuous(breaks = seq(0, 0.8, 0.1),
+                     labels = c(0, "", "20 %", "", "40 %", "", "60 %", "", ""),
+                     limits = c(0, 0.8)) +
+  theme(legend.position = "right",
+        legend.direction = "vertical",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank()) +
+  xlab("") +
+  ylab("")
+
+plot_bar
+ggsave(str_c(path_figures, "incumbent_dist_bar.pdf"), width = 15, height = 10, units = "cm")
+
+```
